@@ -66,22 +66,23 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
       // For simplicity assume we stored order $id as referenceId in paymentLink.notes.referenceId
       const ref = p?.notes?.referenceId; // set when creating link (see below)
       if (ref) {
-        await db.updateDocument(DB_ID, ORDERS, ref, {
-          paymentStatus: 'paid',
-          status: 'accepted',
-          razorpayPaymentId: p.id,
-          updatedAt: new Date().toISOString(),
-        });
+       await db.updateDocument(DB_ID, ORDERS, ref, {
+  paymentStatus: 'paid',
+  status: 'accepted',
+  razorpayPaymentId: p.id,
+});
+
       }
       console.log('💰 payment.captured', p.id, 'order:', ref, 'link:', linkId);
     } else if (evt.event === 'payment.failed') {
       const ref = p?.notes?.referenceId;
       if (ref) {
-        await db.updateDocument(DB_ID, ORDERS, ref, {
-          paymentStatus: 'failed',
-          status: 'cancelled',
-          updatedAt: new Date().toISOString(),
-        });
+       await db.updateDocument(DB_ID, ORDERS, ref, {
+  paymentStatus: 'paid',
+  status: 'accepted',
+  razorpayPaymentId: p.id,
+});
+
       }
       console.log('❌ payment.failed', p?.id, 'order:', ref, 'link:', linkId);
     }
@@ -122,12 +123,12 @@ app.post('/api/payments/create-link', async (req, res) => {
     });
 
     // Attach linkId/referenceId to your order doc
-    await db.updateDocument(DB_ID, ORDERS, referenceId, {
-      referenceId,
-      linkId: link.id,
-      gateway: 'razorpay',
-      updatedAt: new Date().toISOString(),
-    });
+   await db.updateDocument(DB_ID, ORDERS, referenceId, {
+  referenceId,
+  linkId: link.id,
+  gateway: 'razorpay',
+});
+
 
     return res.json({
       id: link.id,
@@ -150,26 +151,31 @@ app.get('/api/payments/status/:referenceId', async (req, res) => {
 
     // If we already have final state from webhook, return quickly
     if (order.paymentStatus === 'paid') {
-      return res.json({ referenceId: ref, status: 'paid', rawStatus: 'paid', linkId: order.linkId, updatedAt: order.updatedAt });
+     return res.json({ referenceId: ref, status: 'paid', rawStatus: 'paid', linkId: order.linkId, updatedAt: order.$updatedAt });
+
     }
     if (order.paymentStatus === 'failed') {
-      return res.json({ referenceId: ref, status: 'failed', rawStatus: 'failed', linkId: order.linkId, updatedAt: order.updatedAt });
+      return res.json({ referenceId: ref, status: 'failed', rawStatus: 'failed', linkId: order.linkId, updatedAt: order.$updatedAt });
+
     }
 
     // Otherwise ask Razorpay for the payment-link status
-    if (!order.linkId) return res.json({ referenceId: ref, status: 'pending', rawStatus: 'created', linkId: null, updatedAt: order.updatedAt });
+    if (!order.linkId) return res.json({ referenceId: ref, status: 'pending', rawStatus: 'created', linkId: null, updatedAt: order.$updatedAt });
 
     const link = await razorpay.paymentLink.fetch(order.linkId);
     const normalized = normalizePL(link.status);
 
     // reflect it into the doc if it changed
     if (normalized === 'paid' && order.paymentStatus !== 'paid') {
-      await db.updateDocument(DB_ID, ORDERS, ref, { paymentStatus: 'paid', updatedAt: new Date().toISOString() });
+      await db.updateDocument(DB_ID, ORDERS, ref, { paymentStatus: 'paid' });
+
     } else if (normalized === 'expired' || normalized === 'cancelled') {
-      await db.updateDocument(DB_ID, ORDERS, ref, { paymentStatus: 'failed', updatedAt: new Date().toISOString() });
+      await db.updateDocument(DB_ID, ORDERS, ref, { paymentStatus: 'failed' });
+
     }
 
-    return res.json({ referenceId: ref, status: normalized, rawStatus: link.status, linkId: order.linkId, updatedAt: new Date().toISOString() });
+    return res.json({ referenceId: ref, status: normalized, rawStatus: link.status, linkId: order.linkId, updatedAt: order.$updatedAt });
+
   } catch (err) {
     const msg = err?.error?.description || err?.message || 'unknown_error';
     console.error('status error:', msg, err?.error || err);
