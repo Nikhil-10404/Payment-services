@@ -32,7 +32,7 @@ const normalizePL = (s) => {
   switch ((s || '').toLowerCase()) {
     case 'paid': return 'paid';
     case 'expired': return 'expired';
-    case 'cancelled': return 'cancelled';
+    case 'canceled': return 'canceled';
     case 'processing':
     case 'issued':
     case 'created':
@@ -68,7 +68,7 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
       if (ref) {
        await db.updateDocument(DB_ID, ORDERS, ref, {
   paymentStatus: 'paid',
-  status: 'accepted',
+  status: 'placed',          // was 'accepted' earlier; now 'placed' after payment
   razorpayPaymentId: p.id,
 });
 
@@ -79,7 +79,7 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
       if (ref) {
        await db.updateDocument(DB_ID, ORDERS, ref, {
   paymentStatus: 'paid',
-  status: 'accepted',
+  status: 'placed',          // was 'accepted' earlier; now 'placed' after payment
   razorpayPaymentId: p.id,
 });
 
@@ -169,7 +169,7 @@ app.get('/api/payments/status/:referenceId', async (req, res) => {
     if (normalized === 'paid' && order.paymentStatus !== 'paid') {
       await db.updateDocument(DB_ID, ORDERS, ref, { paymentStatus: 'paid' });
 
-    } else if (normalized === 'expired' || normalized === 'cancelled') {
+    } else if (normalized === 'expired' || normalized === 'canceled') {
       await db.updateDocument(DB_ID, ORDERS, ref, { paymentStatus: 'failed' });
 
     }
