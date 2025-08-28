@@ -64,26 +64,23 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
       // Appwrite doesn’t query by arbitrary field without Index – add an index on 'linkId' if possible!
       // If no index, you can store referenceId in payment.notes and read it back from webhook p.notes
       // For simplicity assume we stored order $id as referenceId in paymentLink.notes.referenceId
-      const ref = p?.notes?.referenceId; // set when creating link (see below)
-      if (ref) {
-       await db.updateDocument(DB_ID, ORDERS, ref, {
-  paymentStatus: 'paid',
-  status: 'placed',          // was 'accepted' earlier; now 'placed' after payment
-  razorpayPaymentId: p.id,
-});
-
-      }
+      const ref = p?.notes?.referenceId;
+  if (ref) {
+    await db.updateDocument(DB_ID, ORDERS, ref, {
+      paymentStatus: 'paid',
+      status: 'placed',           // only now it's truly "placed"
+      razorpayPaymentId: p.id,
+    });
+  }
       console.log('💰 payment.captured', p.id, 'order:', ref, 'link:', linkId);
     } else if (evt.event === 'payment.failed') {
       const ref = p?.notes?.referenceId;
-      if (ref) {
-       await db.updateDocument(DB_ID, ORDERS, ref, {
-  paymentStatus: 'paid',
-  status: 'placed',          // was 'accepted' earlier; now 'placed' after payment
-  razorpayPaymentId: p.id,
-});
-
-      }
+  if (ref) {
+    await db.updateDocument(DB_ID, ORDERS, ref, {
+      paymentStatus: 'failed',
+      status: 'canceled',         // match your enum spelling
+    });
+  }
       console.log('❌ payment.failed', p?.id, 'order:', ref, 'link:', linkId);
     }
   } catch (e) {
@@ -182,6 +179,30 @@ app.get('/api/payments/status/:referenceId', async (req, res) => {
     return res.status(500).json({ error: 'failed_to_fetch_status', detail: msg });
   }
 });
+
+// src/index.js (after other routes)
+app.post('/api/orders/cancel/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const doc = await db.getDocument(DB_ID, ORDERS, id);
+
+    // Only allow cancel in these cases:
+    if (
+      (doc.paymentMethod === 'UPI' && doc.paymentStatus === 'pending') ||
+      (doc.paymentMethod === 'COD' && doc.status === 'placed')
+    ) {
+      await db.updateDocument(DB_ID, ORDERS, id, {
+        status: 'canceled',
+        paymentStatus: doc.paymentMethod === 'UPI' ? 'failed' : doc.paymentStatus,
+      });
+      return res.json({ ok: true });
+    }
+    return res.status(400).json({ error: 'not_cancellable' });
+  } catch (e) {
+    return res.status(500).json({ error: 'cancel_failed', detail: e?.message });
+  }
+});
+
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('payments-service listening on', PORT));
