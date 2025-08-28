@@ -94,17 +94,62 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
 app.use(express.json({ limit: '1mb' }));
 
 // ---- Create Payment Link and attach to order ----
+// ---- Create Payment Link and attach to order (idempotent/retry-safe) ----
 app.post('/api/payments/create-link', async (req, res) => {
   try {
     const { amount, name, email, contact, referenceId } = req.body;
-    if (!amount || !referenceId) return res.status(400).json({ error: 'amount and referenceId are required' });
+    if (!amount || !referenceId) {
+      return res.status(400).json({ error: 'amount and referenceId are required' });
+    }
 
-    // Create payment-link (UPI only if you disabled others in Razorpay dashboard)
+    // 1) Load the order document
+    const order = await db.getDocument(DB_ID, ORDERS, referenceId).catch(() => null);
+    if (!order) {
+      return res.status(404).json({ error: 'order_not_found' });
+    }
+
+    // 2) If we already have a linkId, try to reuse it if it's still payable
+    if (order.linkId) {
+      try {
+        const existing = await razorpay.paymentLink.fetch(order.linkId);
+        const st = (existing.status || '').toLowerCase(); // created | issued | processing | paid | cancelled | expired
+
+        // If it's still payable, just return it (no new link)
+        if (st === 'created' || st === 'issued' || st === 'processing') {
+          return res.json({
+            id: existing.id,
+            short_url: existing.short_url,
+            status: existing.status,
+            reference_id: existing.reference_id,
+          });
+        }
+
+        // If already PAID, reflect and stop
+        if (st === 'paid') {
+          // Optional: mark paid (webhook should already do this)
+          await db.updateDocument(DB_ID, ORDERS, referenceId, {
+            paymentStatus: 'paid',
+            updatedAt: new Date().toISOString(),
+          });
+          return res.status(409).json({ error: 'already_paid' });
+        }
+        // else: cancelled/expired → we’ll create a new link below
+      } catch (e) {
+        // If fetch fails (link removed or wrong id), fall through to create new link
+      }
+    }
+
+    // 3) Build a unique payment-link reference_id for THIS attempt
+    //    Keep the original order id in notes.referenceId for webhook mapping
+    const attempt = Number(order.linkAttempt || 0) + 1;
+    const plRef = `${referenceId}-a${attempt}`; // e.g., orderId-a1, orderId-a2, ...
+
+    // 4) Create the new link
     const link = await razorpay.paymentLink.create({
       amount: Math.round(Number(amount) * 100),
       currency: 'INR',
       accept_partial: false,
-      reference_id: referenceId,
+      reference_id: plRef,                // <-- must be unique per payment link
       description: 'Foodie order payment',
       customer: {
         name: name || 'Guest',
@@ -115,30 +160,33 @@ app.post('/api/payments/create-link', async (req, res) => {
       reminder_enable: true,
       callback_url: process.env.PUBLIC_CALLBACK_URL || 'https://example.com/thank-you',
       callback_method: 'get',
-      // IMPORTANT: include referenceId in notes so we can read it inside webhook -> payment.notes.referenceId
-      notes: { referenceId },
+      notes: { referenceId },             // <-- keep the original Appwrite order $id here
     });
 
-    // Attach linkId/referenceId to your order doc
-   await db.updateDocument(DB_ID, ORDERS, referenceId, {
-  referenceId,
-  linkId: link.id,
-  gateway: 'razorpay',
-});
-
+    // 5) Store/refresh link on the order
+    await db.updateDocument(DB_ID, ORDERS, referenceId, {
+      referenceId,         // redundant but fine
+      linkId: link.id,
+      linkAttempt: attempt,
+      gateway: 'razorpay',
+      updatedAt: new Date().toISOString(),
+    });
 
     return res.json({
       id: link.id,
       short_url: link.short_url,
       status: link.status,
-      reference_id: referenceId,
+      reference_id: plRef,  // link's own ref
     });
   } catch (err) {
     const msg = err?.error?.description || err?.message || 'unknown_error';
+    // If Razorpay still throws the "reference_id already exists" error for some reason,
+    // we can try to fetch latest from order and return it.
     console.error('create-link error:', msg, err?.error || err);
     return res.status(500).json({ error: 'failed_to_create_payment_link', detail: msg });
   }
 });
+
 
 // ---- Status endpoint for success screen polling ----
 app.get('/api/payments/status/:referenceId', async (req, res) => {
