@@ -96,6 +96,7 @@ app.use(express.json({ limit: '1mb' }));
 // ---- Create Payment Link and attach to order ----
 // ---- Create Payment Link and attach to order (idempotent/retry-safe) ----
 // ---- Create Payment Link and attach to order (idempotent/retry-safe) ----
+// src/index.js  — KEEP ONLY THIS definition for /api/payments/create-link
 app.post('/api/payments/create-link', async (req, res) => {
   try {
     const { amount, name, email, contact, referenceId, callbackUrl } = req.body;
@@ -103,18 +104,15 @@ app.post('/api/payments/create-link', async (req, res) => {
       return res.status(400).json({ error: 'amount and referenceId are required' });
     }
 
-    // 1) Load the order document
+    // 1) Load order
     const order = await db.getDocument(DB_ID, ORDERS, referenceId).catch(() => null);
-    if (!order) {
-      return res.status(404).json({ error: 'order_not_found' });
-    }
+    if (!order) return res.status(404).json({ error: 'order_not_found' });
 
-    // 2) If we already have a linkId, try to reuse it if it's still payable
+    // 2) Reuse current link if still payable
     if (order.linkId) {
       try {
         const existing = await razorpay.paymentLink.fetch(order.linkId);
         const st = (existing.status || '').toLowerCase(); // created | issued | processing | paid | cancelled | expired
-
         if (st === 'created' || st === 'issued' || st === 'processing') {
           return res.json({
             id: existing.id,
@@ -123,50 +121,109 @@ app.post('/api/payments/create-link', async (req, res) => {
             reference_id: existing.reference_id,
           });
         }
-
         if (st === 'paid') {
           await db.updateDocument(DB_ID, ORDERS, referenceId, {
             paymentStatus: 'paid',
+            status: 'placed',
             updatedAt: new Date().toISOString(),
           });
           return res.status(409).json({ error: 'already_paid' });
         }
-        // else: cancelled/expired → we’ll create a new link below
-      } catch (e) {
-        // fall through and create a new link
+        // else cancelled/expired -> continue to create a new link
+      } catch (_) {
+        // ignore, create new link below
       }
     }
 
-    // 3) Unique payment-link ref for THIS attempt
+    // 3) Unique reference for THIS link attempt
     const attempt = Number(order.linkAttempt || 0) + 1;
-    const plRef = `${referenceId}-a${attempt}`;
+    let plRef = `${referenceId}-a${attempt}`;
 
-    // 4) Build callback url (client wins, then env, then last-resort dummy)
     const cbUrl =
       callbackUrl ||
-      process.env.PUBLIC_CALLBACK_URL ||      // e.g. https://yourdomain.com/paydone
+      process.env.PUBLIC_CALLBACK_URL ||
       'https://example.com/thank-you';
 
-    // 5) Create the new link
-    const link = await razorpay.paymentLink.create({
-      amount: Math.round(Number(amount) * 100),
-      currency: 'INR',
-      accept_partial: false,
-      reference_id: plRef,
-      description: 'Foodie order payment',
-      customer: {
-        name: name || 'Guest',
-        email: email || undefined,
-        contact: contact || undefined,
-      },
-      notify: { sms: !!contact, email: !!email },
-      reminder_enable: true,
-      callback_url: cbUrl,                   // 👈 now using client/env callback
-      callback_method: 'get',
-      notes: { referenceId },                // map back to Appwrite order $id
-    });
+    // 4) Create new link (with retry if Razorpay says ref already exists)
+    let link;
+    try {
+      link = await razorpay.paymentLink.create({
+        amount: Math.round(Number(amount) * 100),
+        currency: 'INR',
+        accept_partial: false,
+        reference_id: plRef,           // must be unique
+        description: 'Foodie order payment',
+        customer: {
+          name: name || 'Guest',
+          email: email || undefined,
+          contact: contact || undefined,
+        },
+        notify: { sms: !!contact, email: !!email },
+        reminder_enable: true,
+        callback_url: cbUrl,
+        callback_method: 'get',
+        notes: { referenceId },        // map back to Appwrite order $id
+      });
+    } catch (err) {
+      const msg = (err?.error?.description || '').toLowerCase();
+      if (msg.includes('reference_id') && msg.includes('already exist')) {
+        // Recover by fetching existing link with the same plRef and returning it
+        const list = await razorpay.paymentLink
+          .all({ reference_id: plRef, count: 1 })
+          .catch(() => null);
+        const existing = list?.items?.[0];
+        if (existing) {
+          // Persist on order and return
+          await db.updateDocument(DB_ID, ORDERS, referenceId, {
+            referenceId,
+            linkId: existing.id,
+            linkAttempt: attempt,
+            gateway: 'razorpay',
+            updatedAt: new Date().toISOString(),
+          });
+          return res.json({
+            id: existing.id,
+            short_url: existing.short_url,
+            status: existing.status,
+            reference_id: existing.reference_id,
+          });
+        }
+        // If somehow not found, bump attempt and try create once more
+        const attempt2 = attempt + 1;
+        plRef = `${referenceId}-a${attempt2}`;
+        link = await razorpay.paymentLink.create({
+          amount: Math.round(Number(amount) * 100),
+          currency: 'INR',
+          accept_partial: false,
+          reference_id: plRef,
+          description: 'Foodie order payment',
+          customer: { name: name || 'Guest', email: email || undefined, contact: contact || undefined },
+          notify: { sms: !!contact, email: !!email },
+          reminder_enable: true,
+          callback_url: cbUrl,
+          callback_method: 'get',
+          notes: { referenceId },
+        });
+        // Persist new attempt value
+        await db.updateDocument(DB_ID, ORDERS, referenceId, {
+          referenceId,
+          linkId: link.id,
+          linkAttempt: attempt2,
+          gateway: 'razorpay',
+          updatedAt: new Date().toISOString(),
+        });
+        return res.json({
+          id: link.id,
+          short_url: link.short_url,
+          status: link.status,
+          reference_id: plRef,
+        });
+      }
+      // Unknown error
+      throw err;
+    }
 
-    // 6) Store/refresh link on the order
+    // 5) Persist newest link on the order
     await db.updateDocument(DB_ID, ORDERS, referenceId, {
       referenceId,
       linkId: link.id,
@@ -187,6 +244,7 @@ app.post('/api/payments/create-link', async (req, res) => {
     return res.status(500).json({ error: 'failed_to_create_payment_link', detail: msg });
   }
 });
+
 
 
 
