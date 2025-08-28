@@ -27,76 +27,57 @@ const db = new Databases(awClient);
 const DB_ID = process.env.APPWRITE_DATABASE_ID;
 const ORDERS = process.env.APPWRITE_ORDERS_COLLECTION_ID;
 
-// ---- Utils ----
-const normalizePL = (s) => {
-  switch ((s || '').toLowerCase()) {
-    case 'paid': return 'paid';
-    case 'expired': return 'expired';
-    case 'canceled': return 'canceled';
-    case 'processing':
-    case 'issued':
-    case 'created':
-    default: return 'pending';
-  }
-};
-
+// ---- Health ----
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'payments-service', env: process.env.NODE_ENV || 'dev' });
 });
 
-// ---- Webhook MUST use raw body ----
+/* ------------------------------------------------------------------
+   Razorpay Webhook
+   NOTE: must use raw body BEFORE express.json()
+------------------------------------------------------------------ */
 app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
-  const sig = req.headers['x-razorpay-signature'];
-  const raw = req.body.toString('utf8');
-  const expected = crypto.createHmac('sha256', secret).update(raw).digest('hex');
-  if (expected !== sig) return res.status(400).send('Invalid signature');
-
-  const evt = JSON.parse(raw);
-  const p = evt?.payload?.payment?.entity; // Razorpay payment object
-  // For payment-links, the payment contains invoice_id = payment_link id
-  const linkId = p?.invoice_id;
-
   try {
-    if (evt.event === 'payment.captured') {
-      // find order by linkId (we stored linkId on order doc)
-      // If you indexed referenceId instead, you can keep a map; here we’ll list by linkId stored.
-      // Appwrite doesn’t query by arbitrary field without Index – add an index on 'linkId' if possible!
-      // If no index, you can store referenceId in payment.notes and read it back from webhook p.notes
-      // For simplicity assume we stored order $id as referenceId in paymentLink.notes.referenceId
-      const ref = p?.notes?.referenceId;
-  if (ref) {
-    await db.updateDocument(DB_ID, ORDERS, ref, {
-      paymentStatus: 'paid',
-      status: 'placed',           // only now it's truly "placed"
-      razorpayPaymentId: p.id,
-    });
-  }
-      console.log('💰 payment.captured', p.id, 'order:', ref, 'link:', linkId);
-    } else if (evt.event === 'payment.failed') {
-      const ref = p?.notes?.referenceId;
-  if (ref) {
-    await db.updateDocument(DB_ID, ORDERS, ref, {
-      paymentStatus: 'failed',
-      status: 'canceled',         // match your enum spelling
-    });
-  }
-      console.log('❌ payment.failed', p?.id, 'order:', ref, 'link:', linkId);
-    }
-  } catch (e) {
-    console.error('webhook update error', e?.message || e);
-  }
+    const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    const sig = req.headers['x-razorpay-signature'];
+    const raw = req.body.toString('utf8');
+    const expected = crypto.createHmac('sha256', secret).update(raw).digest('hex');
+    if (expected !== sig) return res.status(400).send('Invalid signature');
 
-  return res.json({ ok: true });
+    const evt = JSON.parse(raw);
+    const p = evt?.payload?.payment?.entity; // Razorpay payment
+    const ref = p?.notes?.referenceId;       // we store Appwrite order $id here when creating link
+
+    if (!ref) return res.json({ ok: true });
+
+    if (evt.event === 'payment.captured') {
+      // Only write fields that exist in your Orders schema
+      await db.updateDocument(DB_ID, ORDERS, ref, {
+        paymentStatus: 'paid',
+        status: 'placed',
+      });
+      console.log('💰 payment.captured', p?.id, 'order:', ref);
+    } else if (evt.event === 'payment.failed') {
+      await db.updateDocument(DB_ID, ORDERS, ref, {
+        paymentStatus: 'failed',
+        status: 'canceled',
+      });
+      console.log('❌ payment.failed', p?.id, 'order:', ref);
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('webhook error:', e?.message || e);
+    return res.status(500).send('webhook_error');
+  }
 });
 
 // Normal JSON for the rest
 app.use(express.json({ limit: '1mb' }));
 
-// ---- Create Payment Link and attach to order ----
-// ---- Create Payment Link and attach to order (idempotent/retry-safe) ----
-// ---- Create Payment Link and attach to order (idempotent/retry-safe) ----
-// src/index.js  — KEEP ONLY THIS definition for /api/payments/create-link
+/* ------------------------------------------------------------------
+   Create Payment Link  (ALWAYS unique reference_id; no unknown fields)
+------------------------------------------------------------------ */
 app.post('/api/payments/create-link', async (req, res) => {
   try {
     const { amount, name, email, contact, referenceId, callbackUrl } = req.body;
@@ -104,133 +85,51 @@ app.post('/api/payments/create-link', async (req, res) => {
       return res.status(400).json({ error: 'amount and referenceId are required' });
     }
 
-    // 1) Load order
+    // 1) Ensure order exists
     const order = await db.getDocument(DB_ID, ORDERS, referenceId).catch(() => null);
     if (!order) return res.status(404).json({ error: 'order_not_found' });
 
-    // 2) Reuse current link if still payable
-    if (order.linkId) {
-      try {
-        const existing = await razorpay.paymentLink.fetch(order.linkId);
-        const st = (existing.status || '').toLowerCase(); // created | issued | processing | paid | cancelled | expired
-        if (st === 'created' || st === 'issued' || st === 'processing') {
-          return res.json({
-            id: existing.id,
-            short_url: existing.short_url,
-            status: existing.status,
-            reference_id: existing.reference_id,
-          });
-        }
-        if (st === 'paid') {
-          await db.updateDocument(DB_ID, ORDERS, referenceId, {
-            paymentStatus: 'paid',
-            status: 'placed',
-            updatedAt: new Date().toISOString(),
-          });
-          return res.status(409).json({ error: 'already_paid' });
-        }
-        // else cancelled/expired -> continue to create a new link
-      } catch (_) {
-        // ignore, create new link below
-      }
-    }
+    // If already paid, short circuit
+    const ps = (order.paymentStatus || '').toLowerCase();
+    if (ps === 'paid') return res.status(409).json({ error: 'already_paid' });
 
-    // 3) Unique reference for THIS link attempt
-    const attempt = Number(order.linkAttempt || 0) + 1;
-    let plRef = `${referenceId}-a${attempt}`;
+    // 2) Always build a UNIQUE payment-link reference_id (no DB counters)
+    const plRef = `${referenceId}-${Date.now()}`;
 
+    // 3) Callback URL (client -> env -> fallback)
     const cbUrl =
       callbackUrl ||
       process.env.PUBLIC_CALLBACK_URL ||
       'https://example.com/thank-you';
 
-    // 4) Create new link (with retry if Razorpay says ref already exists)
-    let link;
-    try {
-      link = await razorpay.paymentLink.create({
-        amount: Math.round(Number(amount) * 100),
-        currency: 'INR',
-        accept_partial: false,
-        reference_id: plRef,           // must be unique
-        description: 'Foodie order payment',
-        customer: {
-          name: name || 'Guest',
-          email: email || undefined,
-          contact: contact || undefined,
-        },
-        notify: { sms: !!contact, email: !!email },
-        reminder_enable: true,
-        callback_url: cbUrl,
-        callback_method: 'get',
-        notes: { referenceId },        // map back to Appwrite order $id
-      });
-    } catch (err) {
-      const msg = (err?.error?.description || '').toLowerCase();
-      if (msg.includes('reference_id') && msg.includes('already exist')) {
-        // Recover by fetching existing link with the same plRef and returning it
-        const list = await razorpay.paymentLink
-          .all({ reference_id: plRef, count: 1 })
-          .catch(() => null);
-        const existing = list?.items?.[0];
-        if (existing) {
-          // Persist on order and return
-          await db.updateDocument(DB_ID, ORDERS, referenceId, {
-            referenceId,
-            linkId: existing.id,
-            linkAttempt: attempt,
-            gateway: 'razorpay',
-            updatedAt: new Date().toISOString(),
-          });
-          return res.json({
-            id: existing.id,
-            short_url: existing.short_url,
-            status: existing.status,
-            reference_id: existing.reference_id,
-          });
-        }
-        // If somehow not found, bump attempt and try create once more
-        const attempt2 = attempt + 1;
-        plRef = `${referenceId}-a${attempt2}`;
-        link = await razorpay.paymentLink.create({
-          amount: Math.round(Number(amount) * 100),
-          currency: 'INR',
-          accept_partial: false,
-          reference_id: plRef,
-          description: 'Foodie order payment',
-          customer: { name: name || 'Guest', email: email || undefined, contact: contact || undefined },
-          notify: { sms: !!contact, email: !!email },
-          reminder_enable: true,
-          callback_url: cbUrl,
-          callback_method: 'get',
-          notes: { referenceId },
-        });
-        // Persist new attempt value
-        await db.updateDocument(DB_ID, ORDERS, referenceId, {
-          referenceId,
-          linkId: link.id,
-          linkAttempt: attempt2,
-          gateway: 'razorpay',
-          updatedAt: new Date().toISOString(),
-        });
-        return res.json({
-          id: link.id,
-          short_url: link.short_url,
-          status: link.status,
-          reference_id: plRef,
-        });
-      }
-      // Unknown error
-      throw err;
-    }
-
-    // 5) Persist newest link on the order
-    await db.updateDocument(DB_ID, ORDERS, referenceId, {
-      referenceId,
-      linkId: link.id,
-      linkAttempt: attempt,
-      gateway: 'razorpay',
-      updatedAt: new Date().toISOString(),
+    // 4) Create payment link
+    const link = await razorpay.paymentLink.create({
+      amount: Math.round(Number(amount) * 100),
+      currency: 'INR',
+      accept_partial: false,
+      reference_id: plRef, // unique per attempt
+      description: 'Foodie order payment',
+      customer: {
+        name: name || 'Guest',
+        email: email || undefined,
+        contact: contact || undefined,
+      },
+      notify: { sms: !!contact, email: !!email },
+      reminder_enable: true,
+      callback_url: cbUrl,
+      callback_method: 'get',
+      notes: { referenceId }, // map back to Appwrite order $id for webhook
     });
+
+    // 5) Mark order "pending_payment" safely (only allowed fields)
+    try {
+      await db.updateDocument(DB_ID, ORDERS, referenceId, {
+        status: 'pending_payment',
+        paymentStatus: 'pending',
+      });
+    } catch (_) {
+      // ignore if your schema names differ
+    }
 
     return res.json({
       id: link.id,
@@ -245,42 +144,24 @@ app.post('/api/payments/create-link', async (req, res) => {
   }
 });
 
-
-
-
-// ---- Status endpoint for success screen polling ----
+/* ------------------------------------------------------------------
+   Payment Status (read from Appwrite; webhook should have updated it)
+------------------------------------------------------------------ */
 app.get('/api/payments/status/:referenceId', async (req, res) => {
   try {
     const ref = req.params.referenceId;
     const order = await db.getDocument(DB_ID, ORDERS, ref);
 
-    // If we already have final state from webhook, return quickly
-    if (order.paymentStatus === 'paid') {
-     return res.json({ referenceId: ref, status: 'paid', rawStatus: 'paid', linkId: order.linkId, updatedAt: order.$updatedAt });
+    const ps = (order.paymentStatus || 'pending').toLowerCase();
+    const normalized = ps === 'paid' ? 'paid'
+                      : ps === 'failed' ? 'failed'
+                      : 'pending';
 
-    }
-    if (order.paymentStatus === 'failed') {
-      return res.json({ referenceId: ref, status: 'failed', rawStatus: 'failed', linkId: order.linkId, updatedAt: order.$updatedAt });
-
-    }
-
-    // Otherwise ask Razorpay for the payment-link status
-    if (!order.linkId) return res.json({ referenceId: ref, status: 'pending', rawStatus: 'created', linkId: null, updatedAt: order.$updatedAt });
-
-    const link = await razorpay.paymentLink.fetch(order.linkId);
-    const normalized = normalizePL(link.status);
-
-    // reflect it into the doc if it changed
-    if (normalized === 'paid' && order.paymentStatus !== 'paid') {
-      await db.updateDocument(DB_ID, ORDERS, ref, { paymentStatus: 'paid' });
-
-    } else if (normalized === 'expired' || normalized === 'canceled') {
-      await db.updateDocument(DB_ID, ORDERS, ref, { paymentStatus: 'failed' });
-
-    }
-
-    return res.json({ referenceId: ref, status: normalized, rawStatus: link.status, linkId: order.linkId, updatedAt: order.$updatedAt });
-
+    return res.json({
+      referenceId: ref,
+      status: normalized,
+      rawStatus: ps,
+    });
   } catch (err) {
     const msg = err?.error?.description || err?.message || 'unknown_error';
     console.error('status error:', msg, err?.error || err);
@@ -288,29 +169,40 @@ app.get('/api/payments/status/:referenceId', async (req, res) => {
   }
 });
 
-// src/index.js (after other routes)
-app.post('/api/orders/cancel/:id', async (req, res) => {
+/* ------------------------------------------------------------------
+   Cancel Order (works for UPI pending or COD placed)
+   We expose two routes that share the same handler.
+------------------------------------------------------------------ */
+app.post('/api/orders/cancel/:id', cancelHandler);
+app.post('/api/payments/cancel/:id', cancelHandler);
+
+async function cancelHandler(req, res) {
   try {
     const id = req.params.id;
     const doc = await db.getDocument(DB_ID, ORDERS, id);
 
-    // Only allow cancel in these cases:
-    if (
-      (doc.paymentMethod === 'UPI' && doc.paymentStatus === 'pending') ||
-      (doc.paymentMethod === 'COD' && doc.status === 'placed')
-    ) {
-      await db.updateDocument(DB_ID, ORDERS, id, {
-        status: 'canceled',
-        paymentStatus: doc.paymentMethod === 'UPI' ? 'failed' : doc.paymentStatus,
-      });
-      return res.json({ ok: true });
+    const pm = (doc.paymentMethod || '').toUpperCase();
+    const ps = (doc.paymentStatus || '').toLowerCase();
+    const st = (doc.status || '').toLowerCase();
+
+    const canUPI = pm === 'UPI' && ps === 'pending';
+    const canCOD = pm === 'COD' && st === 'placed';
+
+    if (!canUPI && !canCOD) {
+      return res.status(400).json({ error: 'not_cancellable' });
     }
-    return res.status(400).json({ error: 'not_cancellable' });
+
+    await db.updateDocument(DB_ID, ORDERS, id, {
+      status: 'canceled',
+      paymentStatus: canUPI ? 'failed' : doc.paymentStatus,
+    });
+
+    return res.json({ ok: true });
   } catch (e) {
+    console.error('cancel error:', e?.message || e);
     return res.status(500).json({ error: 'cancel_failed', detail: e?.message });
   }
-});
-
+}
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('payments-service listening on', PORT));
