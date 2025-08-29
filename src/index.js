@@ -1,4 +1,5 @@
-// src/index.js
+// server.js  (or src/index.js)
+// Node ESM (package.json should have: { "type": "module" })
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -11,13 +12,13 @@ const app = express();
 app.use(cors());
 app.use(morgan('dev'));
 
-// ---- Razorpay client ----
+/* ----------------------------- Razorpay client ----------------------------- */
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// ---- Appwrite server client ----
+/* --------------------------- Appwrite server client ------------------------ */
 const awClient = new Client()
   .setEndpoint(process.env.APPWRITE_ENDPOINT)
   .setProject(process.env.APPWRITE_PROJECT_ID)
@@ -27,19 +28,21 @@ const db = new Databases(awClient);
 const DB_ID = process.env.APPWRITE_DATABASE_ID;
 const ORDERS = process.env.APPWRITE_ORDERS_COLLECTION_ID;
 
+/* ----------------------------- Public base URL ----------------------------- */
 const BASE = String(process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
-if (!BASE || !BASE.startsWith('http')) {
-  console.warn('[WARN] PUBLIC_BASE_URL is missing or not http(s). Razorpay callback will fail.');
+if (!BASE || !/^https?:\/\//i.test(BASE)) {
+  console.warn('[WARN] PUBLIC_BASE_URL is missing/invalid. Example: https://your-api.example.com');
 }
 
-// ---- Health ----
+/* --------------------------------- Health --------------------------------- */
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'payments-service', env: process.env.NODE_ENV || 'dev' });
 });
 
-/* ------------------------------------------------------------------
+/* --------------------------------------------------------------------------
    Razorpay Webhook  (RAW BODY before any express.json())
------------------------------------------------------------------- */
+   Configure in Razorpay Dashboard → Settings → Webhooks
+-------------------------------------------------------------------------- */
 app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     const secret = process.env.RAZORPAY_WEBHOOK_SECRET || '';
@@ -52,54 +55,51 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
 
     const evt = JSON.parse(req.body.toString('utf8'));
 
-    // payment_link.paid (recommended for Payment Links)
+    // Preferred for Payment Links
     if (evt?.event === 'payment_link.paid') {
-      const ref = evt?.payload?.payment_link?.entity?.reference_id; // our unique per-attempt ref, not order id
-      const notesRef = evt?.payload?.payment_link?.entity?.notes?.referenceId; // our Appwrite order $id (we set this)
-      const appwriteOrderId = notesRef || null;
-
-      if (appwriteOrderId) {
+      const notesRef = evt?.payload?.payment_link?.entity?.notes?.referenceId; // our Appwrite order $id
+      if (notesRef) {
         try {
-          await db.updateDocument(DB_ID, ORDERS, appwriteOrderId, {
+          await db.updateDocument(DB_ID, ORDERS, notesRef, {
             paymentStatus: 'paid',
             status: 'placed',
           });
         } catch (e) {
-          console.warn('Appwrite update (payment_link.paid) failed', e?.message || e);
+          console.warn('[Webhook] Appwrite update failed:', e?.message || e);
         }
       }
       return res.json({ ok: true });
     }
 
-    // payment.captured (also works)
+    // Also handle captured payments (covers some flows)
     if (evt?.event === 'payment.captured') {
       const p = evt?.payload?.payment?.entity;
-      const appwriteOrderId = p?.notes?.referenceId; // we set notes.referenceId when creating link
-      if (appwriteOrderId) {
+      const orderId = p?.notes?.referenceId;
+      if (orderId) {
         try {
-          await db.updateDocument(DB_ID, ORDERS, appwriteOrderId, {
+          await db.updateDocument(DB_ID, ORDERS, orderId, {
             paymentStatus: 'paid',
             status: 'placed',
           });
         } catch (e) {
-          console.warn('Appwrite update (payment.captured) failed', e?.message || e);
+          console.warn('[Webhook] Appwrite update (captured) failed:', e?.message || e);
         }
       }
       return res.json({ ok: true });
     }
 
-    // payment.failed (optional)
+    // Optional: mark failed
     if (evt?.event === 'payment.failed') {
       const p = evt?.payload?.payment?.entity;
-      const appwriteOrderId = p?.notes?.referenceId;
-      if (appwriteOrderId) {
+      const orderId = p?.notes?.referenceId;
+      if (orderId) {
         try {
-          await db.updateDocument(DB_ID, ORDERS, appwriteOrderId, {
+          await db.updateDocument(DB_ID, ORDERS, orderId, {
             paymentStatus: 'failed',
-            status: 'canceled',
+            status: 'canceled', // one L
           });
         } catch (e) {
-          console.warn('Appwrite update (payment.failed) failed', e?.message || e);
+          console.warn('[Webhook] Appwrite update (failed) failed:', e?.message || e);
         }
       }
       return res.json({ ok: true });
@@ -112,12 +112,13 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
   }
 });
 
-// Normal JSON for the rest
+/* ---------------------------- JSON for other routes ------------------------ */
 app.use(express.json({ limit: '1mb' }));
 
-/* ------------------------------------------------------------------
-   Create Payment Link (UPI-ready)  — FIXES callback_url error
------------------------------------------------------------------- */
+/* --------------------------------------------------------------------------
+   Create Payment Link (UPI-ready) — FIXES callback_url issue
+   Body: { amount, name?, email?, contact?, referenceId }
+-------------------------------------------------------------------------- */
 app.post('/api/payments/create-link', async (req, res) => {
   try {
     const { amount, name, email, contact, referenceId } = req.body;
@@ -125,27 +126,28 @@ app.post('/api/payments/create-link', async (req, res) => {
       return res.status(400).json({ error: 'amount and referenceId are required' });
     }
 
-    // 1) Ensure order exists
+    // Order must exist
     const order = await db.getDocument(DB_ID, ORDERS, referenceId).catch(() => null);
     if (!order) return res.status(404).json({ error: 'order_not_found' });
 
+    // If already paid, short circuit
     const ps = String(order.paymentStatus || '').toLowerCase();
     if (ps === 'paid') return res.status(409).json({ error: 'already_paid' });
 
-    // 2) Build unique per-attempt reference (Razorpay requirement)
+    // Unique per attempt (Razorpay requirement)
     const plRef = `${referenceId}-${Date.now()}`;
 
-    // 3) Always use a proper PUBLIC callback URL — no client override
-    if (!BASE) return res.status(500).json({ error: 'server_not_configured', detail: 'PUBLIC_BASE_URL missing' });
+    if (!BASE) {
+      return res.status(500).json({ error: 'server_not_configured', detail: 'PUBLIC_BASE_URL missing' });
+    }
     const callbackUrl = `${BASE}/rzp/callback?ref=${encodeURIComponent(referenceId)}`;
 
-    // 4) Create a Payment Link with UPI enabled + callback_url
     const link = await razorpay.paymentLink.create({
       amount: Math.round(Number(amount) * 100), // paise
       currency: 'INR',
       accept_partial: false,
-      upi_link: true,                    // 👈 ensure UPI link generation
-      reference_id: plRef,               // unique per attempt
+      upi_link: true,                   // 👈 ensure UPI payment link
+      reference_id: plRef,
       description: `Foodie order ${referenceId}`,
       customer: {
         name: name || 'Foodie Customer',
@@ -154,12 +156,12 @@ app.post('/api/payments/create-link', async (req, res) => {
       },
       notify: { sms: !!contact, email: !!email },
       reminder_enable: true,
-      callback_url: callbackUrl,         // 👈 REQUIRED — fixes your error
+      callback_url: callbackUrl,        // 👈 REQUIRED by Razorpay for UPI links
       callback_method: 'get',
-      notes: { referenceId },            // map back to Appwrite order $id
+      notes: { referenceId },           // Appwrite order $id for mapping
     });
 
-    // 5) Mark order pending
+    // Mark order as pending
     try {
       await db.updateDocument(DB_ID, ORDERS, referenceId, {
         status: 'pending_payment',
@@ -180,19 +182,17 @@ app.post('/api/payments/create-link', async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------
-   Razorpay Callback Landing (payment app returns here)
-   We verify link status and update Appwrite.
------------------------------------------------------------------- */
+/* --------------------------------------------------------------------------
+   Razorpay Callback landing (user returns from UPI app)
+   GET /rzp/callback?ref=<AppwriteOrderId>&razorpay_payment_link_id=...&razorpay_payment_link_status=paid
+-------------------------------------------------------------------------- */
 app.get('/rzp/callback', async (req, res) => {
   try {
     const appwriteOrderId = String(req.query.ref || '');
-    // Razorpay app appends these query params:
     const linkId = String(req.query.razorpay_payment_link_id || '');
     const linkStatus = String(req.query.razorpay_payment_link_status || ''); // paid / created / cancelled
     const paymentId = String(req.query.razorpay_payment_id || '');
 
-    // Fetch Payment Link to read notes.referenceId (truth source) & status
     let finalPaid = linkStatus === 'paid';
     let orderIdFromNotes = appwriteOrderId;
 
@@ -202,7 +202,7 @@ app.get('/rzp/callback', async (req, res) => {
         if (link?.status === 'paid') finalPaid = true;
         if (link?.notes?.referenceId) orderIdFromNotes = link.notes.referenceId;
       } catch (e) {
-        console.warn('Fetch payment link failed', e?.message || e);
+        console.warn('Fetch payment link failed:', e?.message || e);
       }
     }
 
@@ -213,11 +213,10 @@ app.get('/rzp/callback', async (req, res) => {
           status: 'placed',
         });
       } catch (e) {
-        console.warn('Appwrite update (callback) failed', e?.message || e);
+        console.warn('Appwrite update (callback) failed:', e?.message || e);
       }
     }
 
-    // Tiny HTML that tells the user to return to the app
     res.setHeader('Content-Type', 'text/html');
     return res.end(`
       <html>
@@ -236,9 +235,9 @@ app.get('/rzp/callback', async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------
-   Payment Status (read from Appwrite — webhook/callback should update)
------------------------------------------------------------------- */
+/* --------------------------------------------------------------------------
+   Payment Status (client polls this if needed)
+-------------------------------------------------------------------------- */
 app.get('/api/payments/status/:referenceId', async (req, res) => {
   try {
     const ref = req.params.referenceId;
@@ -253,9 +252,11 @@ app.get('/api/payments/status/:referenceId', async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------
+/* --------------------------------------------------------------------------
    Cancel Order (UPI pending or COD placed)
------------------------------------------------------------------- */
+   - Idempotent
+   - Allows UPI cancel while link is pending (status 'pending_payment' or paymentStatus 'pending')
+-------------------------------------------------------------------------- */
 app.post('/api/orders/cancel/:id', cancelHandler);
 app.post('/api/payments/cancel/:id', cancelHandler);
 
@@ -264,28 +265,38 @@ async function cancelHandler(req, res) {
     const id = req.params.id;
     const doc = await db.getDocument(DB_ID, ORDERS, id);
 
-    const pm = String(doc.paymentMethod || '').toUpperCase();
-    const ps = String(doc.paymentStatus || '').toLowerCase();
-    const st = String(doc.status || '').toLowerCase();
+    const pm = String(doc.paymentMethod || '').toUpperCase(); // 'UPI' | 'COD'
+    const ps = String(doc.paymentStatus || '').toLowerCase(); // 'pending' | 'paid' | 'failed'
+    const st = String(doc.status || '').toLowerCase();        // 'placed' | 'pending_payment' | 'accepted' | ...
 
-    const canUPI = pm === 'UPI' && ps === 'pending';
+    // Idempotent: already canceled
+    if (st === 'canceled' || st === 'cancelled') {
+      return res.json({ ok: true, id, already: true });
+    }
+
+    // Cancellable rules
+    const canUPI = pm === 'UPI' && (ps === 'pending' || st === 'pending_payment');
     const canCOD = pm === 'COD' && st === 'placed';
 
     if (!canUPI && !canCOD) {
-      return res.status(400).json({ error: 'not_cancellable' });
+      return res.status(409).json({
+        error: 'not_cancellable',
+        reason: { paymentMethod: pm, paymentStatus: ps, status: st },
+      });
     }
 
     await db.updateDocument(DB_ID, ORDERS, id, {
-      status: 'canceled',
+      status: 'canceled',                              // one L (your schema)
       paymentStatus: canUPI ? 'failed' : doc.paymentStatus,
     });
 
-    return res.json({ ok: true });
+    return res.json({ ok: true, id });
   } catch (e) {
     console.error('cancel error:', e?.message || e);
-    return res.status(500).json({ error: 'cancel_failed', detail: e?.message });
+    return res.status(500).json({ error: 'cancel_failed', detail: e?.message || 'unknown_error' });
   }
 }
 
+/* --------------------------------- Start ---------------------------------- */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('payments-service listening on', PORT));
