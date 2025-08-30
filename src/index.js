@@ -193,7 +193,7 @@ if (paymentMethod === "UPI") {
   try {
     if (!BASE) throw new Error("PUBLIC_BASE_URL missing");
     const plRef = `${orderDoc.$id}-${Date.now()}`;
-    const callbackUrl = `${BASE}/rzp/callback?ref=${encodeURIComponent(orderDoc.$id)}`;
+   const callbackUrl = req.body.callbackUrl || `${BASE}/rzp/callback?ref=${encodeURIComponent(orderDoc.$id)}`;
 
     // ✅ ensure amount is integer paise
     const amountPaise = Math.round(parseFloat(total) * 100);
@@ -201,23 +201,25 @@ if (paymentMethod === "UPI") {
       throw new Error(`Invalid order total: ${total}`);
     }
 
-    const link = await razorpay.paymentLink.create({
-      amount: amountPaise,
-      currency: "INR",
-      accept_partial: false,
-      reference_id: plRef,
-      description: `Foodie order ${orderDoc.$id}`,
-      customer: {
-        name: address?.fullName || "Foodie Customer",
-        email: address?.email || undefined,
-        contact: address?.phone || undefined,
-      },
-      notify: { sms: !!address?.phone, email: !!address?.email },
-      reminder_enable: true,
-      callback_url: callbackUrl,
-      callback_method: "get",
-      notes: { referenceId: orderDoc.$id },
-    });
+   const link = await razorpay.paymentLink.create({
+  amount: Math.round(Number(total) * 100),
+  currency: "INR",
+  accept_partial: false,
+  upi_link: true,
+  reference_id: plRef,
+  description: `Foodie order ${orderDoc.$id}`,
+  customer: {
+    name: address?.fullName || "Foodie Customer",
+    email: address?.email || undefined,
+    contact: address?.phone || undefined,
+  },
+  notify: { sms: !!address?.phone, email: !!address?.email },
+  reminder_enable: true,
+  callback_url: callbackUrl,   // 👈 updated
+  callback_method: "get",
+  notes: { referenceId: orderDoc.$id },
+});
+
 
     await db.updateDocument(DB_ID, ORDERS, orderDoc.$id, {
       status: "pending_payment",
