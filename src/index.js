@@ -99,6 +99,11 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
     return res.status(500).send('webhook_error');
   }
 });
+
+app.post('/api/payments/create-link', (req, res, next) => {
+  req.url = '/api/orders/create';
+  next();
+});
 /* ------------------------------------------------------------------
    Create Order (COD or UPI) → auto-create driver doc & start simulator
 ------------------------------------------------------------------ */
