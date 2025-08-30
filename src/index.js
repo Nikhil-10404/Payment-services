@@ -410,11 +410,7 @@ async function cancelHandler(req, res) {
       });
     }
 
-    // Update order → cancelled
-    await db.updateDocument(DB_ID, ORDERS, id, {
-      status: "canceled",  // 👈 ensures timeline shows ❌ Cancelled
-      paymentStatus: canUPI ? "failed" : doc.paymentStatus,
-    });
+    await db.deleteDocument(DB_ID, ORDERS, id); // 👈 hard delete from DB
 
     // Cleanup driver docs if any
     try {
