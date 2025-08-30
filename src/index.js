@@ -14,7 +14,7 @@ app.use(morgan('dev'));
 
 app.use(express.json({ limit: '1mb' }));
 
-console.log("🛒 Incoming payload:", req.body);
+
 
 /* ----------------------------- Razorpay client ----------------------------- */
 const razorpay = new Razorpay({
@@ -429,6 +429,7 @@ async function cancelHandler(req, res) {
   }
 }
 
+console.log("🛒 Incoming payload:", req.body);
 
 
 /* --------------------------------- Start ---------------------------------- */
