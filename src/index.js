@@ -1,10 +1,11 @@
-// server.js  (or src/index.js)
+// server.js (or src/index.js)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
 import crypto from 'crypto';
 import Razorpay from 'razorpay';
+import fetch from 'node-fetch'; // make sure installed: npm install node-fetch
 import { Client, Databases, ID } from 'node-appwrite';
 
 const app = express();
@@ -26,8 +27,8 @@ const awClient = new Client()
 const db = new Databases(awClient);
 const DB_ID = process.env.APPWRITE_DATABASE_ID;
 const ORDERS = process.env.APPWRITE_ORDERS_COLLECTION_ID;
-const RESTAURANTS = process.env.APPWRITE_RESTAURANTS_COLLECTION_ID; // 👈 new
-const DRIVERS = process.env.APPWRITE_DRIVERS_COLLECTION_ID;         // 👈 new
+const RESTAURANTS = process.env.APPWRITE_RESTAURANTS_COLLECTION_ID;
+const DRIVERS = process.env.APPWRITE_DRIVERS_COLLECTION_ID;
 
 /* ----------------------------- Public base URL ----------------------------- */
 const BASE = String(process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
@@ -58,46 +59,32 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
     if (evt?.event === 'payment_link.paid') {
       const notesRef = evt?.payload?.payment_link?.entity?.notes?.referenceId;
       if (notesRef) {
-        try {
-          await db.updateDocument(DB_ID, ORDERS, notesRef, {
-            paymentStatus: 'paid',
-            status: 'placed',
-          });
-        } catch (e) {
-          console.warn('[Webhook] Appwrite update failed:', e?.message || e);
-        }
+        await db.updateDocument(DB_ID, ORDERS, notesRef, {
+          paymentStatus: 'paid',
+          status: 'placed',
+        }).catch(e => console.warn('[Webhook] update failed', e?.message));
       }
       return res.json({ ok: true });
     }
 
     if (evt?.event === 'payment.captured') {
-      const p = evt?.payload?.payment?.entity;
-      const orderId = p?.notes?.referenceId;
+      const orderId = evt?.payload?.payment?.entity?.notes?.referenceId;
       if (orderId) {
-        try {
-          await db.updateDocument(DB_ID, ORDERS, orderId, {
-            paymentStatus: 'paid',
-            status: 'placed',
-          });
-        } catch (e) {
-          console.warn('[Webhook] Appwrite update (captured) failed:', e?.message || e);
-        }
+        await db.updateDocument(DB_ID, ORDERS, orderId, {
+          paymentStatus: 'paid',
+          status: 'placed',
+        }).catch(e => console.warn('[Webhook] captured update failed', e?.message));
       }
       return res.json({ ok: true });
     }
 
     if (evt?.event === 'payment.failed') {
-      const p = evt?.payload?.payment?.entity;
-      const orderId = p?.notes?.referenceId;
+      const orderId = evt?.payload?.payment?.entity?.notes?.referenceId;
       if (orderId) {
-        try {
-          await db.updateDocument(DB_ID, ORDERS, orderId, {
-            paymentStatus: 'failed',
-            status: 'canceled',
-          });
-        } catch (e) {
-          console.warn('[Webhook] Appwrite update (failed) failed:', e?.message || e);
-        }
+        await db.updateDocument(DB_ID, ORDERS, orderId, {
+          paymentStatus: 'failed',
+          status: 'canceled',
+        }).catch(e => console.warn('[Webhook] failed update', e?.message));
       }
       return res.json({ ok: true });
     }
@@ -111,11 +98,8 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
 
 app.use(express.json({ limit: '1mb' }));
 
-/* --------------------------------------------------------------------------
-   NEW: Create COD Order + Driver entry
--------------------------------------------------------------------------- */
 /* ------------------------------------------------------------------
-   Create Order (COD or UPI) → also creates driver doc
+   Create Order (COD or UPI) → auto-create driver doc & start simulator
 ------------------------------------------------------------------ */
 app.post('/api/orders/create', async (req, res) => {
   try {
@@ -129,7 +113,7 @@ app.post('/api/orders/create', async (req, res) => {
       gst,
       discount,
       total,
-      address,
+      address,       // should include lat/lng
       paymentMethod,
     } = req.body;
 
@@ -138,7 +122,7 @@ app.post('/api/orders/create', async (req, res) => {
     }
 
     // 1) Create order doc
-    const orderDoc = await db.createDocument(DB_ID, ORDERS, 'unique()', {
+    const orderDoc = await db.createDocument(DB_ID, ORDERS, ID.unique(), {
       restaurantId,
       restaurantName,
       items: JSON.stringify(items),
@@ -150,25 +134,42 @@ app.post('/api/orders/create', async (req, res) => {
       total,
       address: JSON.stringify(address),
       paymentMethod,
-      paymentStatus: paymentMethod === 'COD' ? 'pending' : 'pending',
+      paymentStatus: 'pending',
       status: 'placed',
     });
 
-    // 2) Fetch restaurant to get coords
-    const rest = await db.getDocument(DB_ID, process.env.APPWRITE_RESTAURANTS_COLLECTION_ID, restaurantId);
+    // 2) Get restaurant (start point)
+    const rest = await db.getDocument(DB_ID, RESTAURANTS, restaurantId);
 
-    // 3) Create driver doc (initial location = restaurant coords)
-    await db.createDocument(DB_ID, process.env.APPWRITE_DRIVERS_COLLECTION_ID, 'unique()', {
+    // 3) Destination from address
+    let destLat = address?.lat, destLng = address?.lng;
+    if (!destLat || !destLng) {
+      console.warn('[WARN] No lat/lng in address payload, fallback 0,0');
+      destLat = 0; destLng = 0;
+    }
+
+    // 4) Create driver doc
+    const driverDoc = await db.createDocument(DB_ID, DRIVERS, ID.unique(), {
       orderId: orderDoc.$id,
       lat: rest.lat,
       lng: rest.lng,
+      destLat,
+      destLng,
       status: 'delivering',
     });
 
-    // 4) If UPI, also create a Razorpay link
+    // 5) Start simulator 🚀
+    startDriverSimulator(driverDoc.$id, {
+      startLat: rest.lat,
+      startLng: rest.lng,
+      destLat,
+      destLng,
+      orderId: orderDoc.$id,
+    });
+
+    // 6) If UPI → create Razorpay link
     if (paymentMethod === 'UPI') {
-      const base = process.env.PUBLIC_BASE_URL;
-      const linkRes = await fetch(`${base}/api/payments/create-link`, {
+      const linkRes = await fetch(`${BASE}/api/payments/create-link`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -182,7 +183,7 @@ app.post('/api/orders/create', async (req, res) => {
       return res.json({ ok: true, order: orderDoc, payment: linkJson });
     }
 
-    // COD
+    // COD → return order
     return res.json({ ok: true, order: orderDoc });
   } catch (e) {
     console.error('create-order error:', e?.message || e);
@@ -190,113 +191,71 @@ app.post('/api/orders/create', async (req, res) => {
   }
 });
 
-
 /* --------------------------------------------------------------------------
-   Payment Link creation (UPI)
+   🚀 Driver Simulator (auto runs per order)
 -------------------------------------------------------------------------- */
-app.post('/api/payments/create-link', async (req, res) => {
-  try {
-    const { amount, name, email, contact, referenceId } = req.body;
-    if (!amount || !referenceId) {
-      return res.status(400).json({ error: 'amount and referenceId are required' });
-    }
-
-    const order = await db.getDocument(DB_ID, ORDERS, referenceId).catch(() => null);
-    if (!order) return res.status(404).json({ error: 'order_not_found' });
-
-    const ps = String(order.paymentStatus || '').toLowerCase();
-    if (ps === 'paid') return res.status(409).json({ error: 'already_paid' });
-
-    const plRef = `${referenceId}-${Date.now()}`;
-    const callbackUrl = `${BASE}/rzp/callback?ref=${encodeURIComponent(referenceId)}`;
-
-    const link = await razorpay.paymentLink.create({
-      amount: Math.round(Number(amount) * 100),
-      currency: 'INR',
-      accept_partial: false,
-      upi_link: true,
-      reference_id: plRef,
-      description: `Foodie order ${referenceId}`,
-      customer: { name: name || 'Foodie Customer', email, contact },
-      notify: { sms: !!contact, email: !!email },
-      reminder_enable: true,
-      callback_url: callbackUrl,
-      callback_method: 'get',
-      notes: { referenceId },
-    });
-
-    await db.updateDocument(DB_ID, ORDERS, referenceId, {
-      status: 'pending_payment',
-      paymentStatus: 'pending',
-    });
-
-    return res.json({
-      id: link.id,
-      short_url: link.short_url,
-      status: link.status,
-      reference_id: plRef,
-    });
-  } catch (err) {
-    const msg = err?.error?.description || err?.message || 'unknown_error';
-    console.error('create-link error:', msg, err?.error || err);
-    return res.status(500).json({ error: 'failed_to_create_payment_link', detail: msg });
-  }
-});
-
 /* --------------------------------------------------------------------------
-   Payment status, cancel, etc (unchanged from your code)
+   🚀 Driver Simulator (auto status transitions)
 -------------------------------------------------------------------------- */
+async function startDriverSimulator(driverId, { startLat, startLng, destLat, destLng, orderId }) {
+  console.log(`[SIM] Starting driver simulator for order ${orderId}`);
 
-app.get('/api/payments/status/:referenceId', async (req, res) => {
+  let lat = startLat, lng = startLng;
+  const step = 0.0005; // ≈ 50m per step
+
+  // Step 1: mark order as preparing
   try {
-    const ref = req.params.referenceId;
-    const order = await db.getDocument(DB_ID, ORDERS, ref);
-    const ps = String(order.paymentStatus || 'pending').toLowerCase();
-    const normalized = ps === 'paid' ? 'paid' : ps === 'failed' ? 'failed' : 'pending';
-    return res.json({ referenceId: ref, status: normalized, rawStatus: ps });
-  } catch (err) {
-    const msg = err?.error?.description || err?.message || 'unknown_error';
-    console.error('status error:', msg, err?.error || err);
-    return res.status(500).json({ error: 'failed_to_fetch_status', detail: msg });
-  }
-});
-
-app.post('/api/orders/cancel/:id', cancelHandler);
-app.post('/api/payments/cancel/:id', cancelHandler);
-
-async function cancelHandler(req, res) {
-  try {
-    const id = req.params.id;
-    const doc = await db.getDocument(DB_ID, ORDERS, id);
-    const pm = String(doc.paymentMethod || '').toUpperCase();
-    const ps = String(doc.paymentStatus || '').toLowerCase();
-    const st = String(doc.status || '').toLowerCase();
-
-    if (st === 'canceled' || st === 'cancelled') {
-      return res.json({ ok: true, id, already: true });
-    }
-
-    const canUPI = pm === 'UPI' && (ps === 'pending' || st === 'pending_payment');
-    const canCOD = pm === 'COD' && st === 'placed';
-
-    if (!canUPI && !canCOD) {
-      return res.status(409).json({
-        error: 'not_cancellable',
-        reason: { paymentMethod: pm, paymentStatus: ps, status: st },
-      });
-    }
-
-    await db.updateDocument(DB_ID, ORDERS, id, {
-      status: 'canceled',
-      paymentStatus: canUPI ? 'failed' : doc.paymentStatus,
-    });
-
-    return res.json({ ok: true, id });
+    await db.updateDocument(DB_ID, ORDERS, orderId, { status: "preparing" });
+    console.log(`[SIM] Order ${orderId} → preparing`);
   } catch (e) {
-    console.error('cancel error:', e?.message || e);
-    return res.status(500).json({ error: 'cancel_failed', detail: e?.message || 'unknown_error' });
+    console.warn("[SIM] failed to set preparing:", e?.message || e);
   }
+
+  // After short delay, switch to on_the_way
+  setTimeout(async () => {
+    try {
+      await db.updateDocument(DB_ID, ORDERS, orderId, { status: "on_the_way" });
+      await db.updateDocument(DB_ID, DRIVERS, driverId, { status: "on_the_way" });
+      console.log(`[SIM] Order ${orderId} → on_the_way`);
+    } catch (e) {
+      console.warn("[SIM] failed to set on_the_way:", e?.message || e);
+    }
+  }, 5000); // wait 5s in "preparing" before going out
+
+  // Step 2: move driver until delivered
+  const interval = setInterval(async () => {
+    try {
+      const dLat = destLat - lat;
+      const dLng = destLng - lng;
+
+      // Arrived
+      if (Math.abs(dLat) < 0.0005 && Math.abs(dLng) < 0.0005) {
+        await db.updateDocument(DB_ID, DRIVERS, driverId, {
+          lat: destLat,
+          lng: destLng,
+          status: "delivered",
+        });
+        await db.updateDocument(DB_ID, ORDERS, orderId, {
+          status: "delivered",
+        });
+        console.log(`[SIM] Order ${orderId} delivered ✅`);
+        clearInterval(interval);
+        return;
+      }
+
+      // Move closer step by step
+      lat += step * Math.sign(dLat);
+      lng += step * Math.sign(dLng);
+
+      await db.updateDocument(DB_ID, DRIVERS, driverId, { lat, lng });
+      console.log(`[SIM] Driver ${driverId} moved closer`);
+    } catch (e) {
+      console.error("[SIM] error", e?.message || e);
+      clearInterval(interval);
+    }
+  }, 5000); // every 5s
 }
+
 
 /* --------------------------------- Start ---------------------------------- */
 const PORT = process.env.PORT || 8080;
