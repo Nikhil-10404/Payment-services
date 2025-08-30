@@ -19,6 +19,7 @@
     "express": "^5.1.0",
     "morgan": "^1.10.1",
     "node-appwrite": "^18.0.0",
+    "node-fetch": "^3.3.2",
     "razorpay": "^2.9.6"
   }
 }
