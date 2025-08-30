@@ -100,10 +100,48 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
   }
 });
 
-app.post('/api/payments/create-link', (req, res, next) => {
-  req.url = '/api/orders/create';
-  next();
+// Compatibility route for older frontend clients
+app.post('/api/payments/create-link', async (req, res) => {
+  try {
+    const { referenceId, amount, name, callbackUrl } = req.body;
+
+    if (!referenceId || !amount) {
+      return res.status(400).json({ error: "missing_required_fields" });
+    }
+
+    if (!BASE) throw new Error("PUBLIC_BASE_URL missing");
+
+    const paymentPayload = {
+      amount: Math.round(Number(amount) * 100),
+      currency: "INR",
+      accept_partial: false,
+      reference_id: `${referenceId}-${Date.now()}`,
+      description: `Foodie order ${referenceId}`,
+      customer: {
+        name: name || "Foodie Customer",
+      },
+      notify: { sms: false, email: false },
+      reminder_enable: true,
+      callback_url: callbackUrl || `${BASE}/rzp/callback?ref=${encodeURIComponent(referenceId)}`,
+      callback_method: "get",
+      notes: { referenceId },
+    };
+
+    // 👇 enable upi_link in live mode only
+    if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_ID.startsWith("rzp_live_")) {
+      paymentPayload.upi_link = true;
+    }
+
+    const link = await razorpay.paymentLink.create(paymentPayload);
+
+    console.log("✅ Payment link created (compat mode):", referenceId);
+    return res.json({ ok: true, payment: link });
+  } catch (err) {
+    console.error("⚠️ create-link error:", err?.message, err);
+    return res.status(500).json({ error: "upi_create_link_failed", detail: err?.message });
+  }
 });
+
 /* ------------------------------------------------------------------
    Create Order (COD or UPI) → auto-create driver doc & start simulator
 ------------------------------------------------------------------ */
