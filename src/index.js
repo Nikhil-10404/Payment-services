@@ -188,43 +188,57 @@ app.post('/api/orders/create', async (req, res) => {
     });
 
     // 5) Handle UPI
-    if (paymentMethod === "UPI") {
-      try {
-        if (!BASE) throw new Error("PUBLIC_BASE_URL missing");
-        const plRef = `${orderDoc.$id}-${Date.now()}`;
-        const callbackUrl = `${BASE}/rzp/callback?ref=${encodeURIComponent(orderDoc.$id)}`;
+// 5) Handle UPI
+if (paymentMethod === "UPI") {
+  try {
+    if (!BASE) throw new Error("PUBLIC_BASE_URL missing");
+    const plRef = `${orderDoc.$id}-${Date.now()}`;
+    const callbackUrl = `${BASE}/rzp/callback?ref=${encodeURIComponent(orderDoc.$id)}`;
 
-        const link = await razorpay.paymentLink.create({
-          amount: Math.round(Number(total) * 100),
-          currency: "INR",
-          accept_partial: false,
-          upi_link: true,
-          reference_id: plRef,
-          description: `Foodie order ${orderDoc.$id}`,
-          customer: {
-            name: address?.fullName || "Foodie Customer",
-            email: address?.email || undefined,
-            contact: address?.phone || undefined,
-          },
-          notify: { sms: !!address?.phone, email: !!address?.email },
-          reminder_enable: true,
-          callback_url: callbackUrl,
-          callback_method: "get",
-          notes: { referenceId: orderDoc.$id },
-        });
-
-        await db.updateDocument(DB_ID, ORDERS, orderDoc.$id, {
-          status: "pending_payment",
-          paymentStatus: "pending",
-        });
-
-        console.log("✅ Order created (UPI):", orderDoc.$id);
-        return res.json({ ok: true, order: orderDoc, payment: link });
-      } catch (err) {
-        console.error("⚠️ Razorpay link error:", err);
-        return res.json({ ok: true, order: orderDoc, payment: null });
-      }
+    // ✅ ensure amount is integer paise
+    const amountPaise = Math.round(parseFloat(total) * 100);
+    if (!amountPaise || isNaN(amountPaise)) {
+      throw new Error(`Invalid order total: ${total}`);
     }
+
+    const link = await razorpay.paymentLink.create({
+      amount: amountPaise,
+      currency: "INR",
+      accept_partial: false,
+      reference_id: plRef,
+      description: `Foodie order ${orderDoc.$id}`,
+      customer: {
+        name: address?.fullName || "Foodie Customer",
+        email: address?.email || undefined,
+        contact: address?.phone || undefined,
+      },
+      notify: { sms: !!address?.phone, email: !!address?.email },
+      reminder_enable: true,
+      callback_url: callbackUrl,
+      callback_method: "get",
+      notes: { referenceId: orderDoc.$id },
+    });
+
+    await db.updateDocument(DB_ID, ORDERS, orderDoc.$id, {
+      status: "pending_payment",
+      paymentStatus: "pending",
+    });
+
+    console.log("✅ Order created (UPI):", orderDoc.$id);
+    return res.json({ ok: true, order: orderDoc, payment: link });
+  } catch (err) {
+    console.error("⚠️ Razorpay link error:", {
+      message: err?.message,
+      error: err?.error || null,
+      stack: err?.stack,
+    });
+    return res.status(500).json({
+      error: "upi_order_failed",
+      detail: err?.message || "unknown",
+    });
+  }
+}
+
 
     // COD → return order
     console.log("✅ Order created (COD):", orderDoc.$id);
