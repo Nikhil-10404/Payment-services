@@ -101,6 +101,9 @@ app.use(express.json({ limit: '1mb' }));
 /* ------------------------------------------------------------------
    Create Order (COD or UPI) → auto-create driver doc & start simulator
 ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------
+   Create Order (COD or UPI) → auto-create driver doc & start simulator
+------------------------------------------------------------------ */
 app.post('/api/orders/create', async (req, res) => {
   try {
     const {
@@ -121,7 +124,7 @@ app.post('/api/orders/create', async (req, res) => {
       return res.status(400).json({ error: 'missing_required_fields' });
     }
 
-    // 1) Create order doc
+    // 1) Create order doc (store full address as JSON string)
     const orderDoc = await db.createDocument(DB_ID, ORDERS, ID.unique(), {
       restaurantId,
       restaurantName,
@@ -132,7 +135,7 @@ app.post('/api/orders/create', async (req, res) => {
       gst,
       discount,
       total,
-      address: JSON.stringify(address),
+      address: JSON.stringify(address || {}), // keep original full payload
       paymentMethod,
       paymentStatus: 'pending',
       status: 'placed',
@@ -141,14 +144,24 @@ app.post('/api/orders/create', async (req, res) => {
     // 2) Get restaurant (start point)
     const rest = await db.getDocument(DB_ID, RESTAURANTS, restaurantId);
 
-    // 3) Destination from address
-    let destLat = address?.lat, destLng = address?.lng;
-    if (!destLat || !destLng) {
-      console.warn('[WARN] No lat/lng in address payload, fallback 0,0');
-      destLat = 0; destLng = 0;
+    // 3) Extract and validate destination coords from address
+    let destLat = null, destLng = null;
+    if (address) {
+      if (typeof address.lat === "number" && !isNaN(address.lat)) {
+        destLat = address.lat;
+      }
+      if (typeof address.lng === "number" && !isNaN(address.lng)) {
+        destLng = address.lng;
+      }
     }
 
-    // 4) Create driver doc
+    if (destLat === null || destLng === null) {
+      console.warn(`[WARN] No valid lat/lng in address for order ${orderDoc.$id}, fallback to 0,0`);
+      destLat = 0;
+      destLng = 0;
+    }
+
+    // 4) Create driver doc with clean coords
     const driverDoc = await db.createDocument(DB_ID, DRIVERS, ID.unique(), {
       orderId: orderDoc.$id,
       lat: rest.lat,
@@ -158,7 +171,7 @@ app.post('/api/orders/create', async (req, res) => {
       status: 'preparing',
     });
 
-    // 5) Start simulator 🚀
+    // 5) Start driver simulator 🚀
     startDriverSimulator(driverDoc.$id, {
       startLat: rest.lat,
       startLng: rest.lng,
@@ -190,6 +203,7 @@ app.post('/api/orders/create', async (req, res) => {
     return res.status(500).json({ error: 'failed_to_create_order', detail: e?.message });
   }
 });
+
 
 /* --------------------------------------------------------------------------
    🚀 Driver Simulator (auto runs per order)
