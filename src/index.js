@@ -6,7 +6,7 @@ import morgan from 'morgan';
 import crypto from 'crypto';
 import Razorpay from 'razorpay';
 import fetch from 'node-fetch'; // make sure installed: npm install node-fetch
-import { Client, Databases, ID } from 'node-appwrite';
+import { Client, Databases, ID, Query } from 'node-appwrite';
 
 const app = express();
 app.use(cors());
