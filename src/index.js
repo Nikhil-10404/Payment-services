@@ -155,7 +155,7 @@ app.post('/api/orders/create', async (req, res) => {
       lng: rest.lng,
       destLat,
       destLng,
-      status: 'delivering',
+      status: 'preparing',
     });
 
     // 5) Start simulator 🚀
