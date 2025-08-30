@@ -12,6 +12,10 @@ const app = express();
 app.use(cors());
 app.use(morgan('dev'));
 
+app.use(express.json({ limit: '1mb' }));
+
+console.log("🛒 Incoming payload:", req.body);
+
 /* ----------------------------- Razorpay client ----------------------------- */
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
@@ -95,15 +99,6 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
     return res.status(500).send('webhook_error');
   }
 });
-
-app.use(express.json({ limit: '1mb' }));
-
-/* ------------------------------------------------------------------
-   Create Order (COD or UPI) → auto-create driver doc & start simulator
------------------------------------------------------------------- */
-/* ------------------------------------------------------------------
-   Create Order (COD or UPI) → auto-create driver doc & start simulator
------------------------------------------------------------------- */
 /* ------------------------------------------------------------------
    Create Order (COD or UPI) → auto-create driver doc & start simulator
 ------------------------------------------------------------------ */
