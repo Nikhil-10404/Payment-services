@@ -360,15 +360,24 @@ app.get('/rzp/callback', async (req, res) => {
       }
     }
 
-    // 👇 Redirect back to frontend OrderDetails
-    return res.redirect(
-      `${process.env.APP_FRONTEND_URL}/orders/${orderIdFromNotes}`
-    );
+    // 👇 Use deep link if configured, else frontend URL
+    let redirectUrl;
+    if (process.env.APP_DEEP_LINK_SCHEME) {
+      // Example: APP_DEEP_LINK_SCHEME=myapp://
+      redirectUrl = `${process.env.APP_DEEP_LINK_SCHEME}orders/${orderIdFromNotes}`;
+    } else {
+      redirectUrl = `${process.env.APP_FRONTEND_URL}/orders/${orderIdFromNotes}`;
+    }
+
+    console.log("🔗 Redirecting user to:", redirectUrl);
+    return res.redirect(redirectUrl);
+
   } catch (e) {
     console.error('callback error:', e?.message || e);
     return res.status(500).send('callback_error');
   }
 });
+
 
 
 /* --------------------------------------------------------------------------
