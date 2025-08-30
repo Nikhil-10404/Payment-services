@@ -104,7 +104,9 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
 ------------------------------------------------------------------ */
 app.post('/api/orders/create', async (req, res) => {
   try {
-    console.log("🛒 Incoming payload:", req.body);
+      console.log("🛒 Incoming raw keys:", Object.keys(req.body));
+    console.log("🛒 Full raw body JSON:", JSON.stringify(req.body, null, 2));
+
     const {
       restaurantId,
       restaurantName,
