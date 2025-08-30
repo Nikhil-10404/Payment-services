@@ -104,6 +104,7 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
 ------------------------------------------------------------------ */
 app.post('/api/orders/create', async (req, res) => {
   try {
+    console.log("🛒 Incoming payload:", req.body);
     const {
       restaurantId,
       restaurantName,
@@ -429,7 +430,7 @@ async function cancelHandler(req, res) {
   }
 }
 
-console.log("🛒 Incoming payload:", req.body);
+
 
 
 /* --------------------------------- Start ---------------------------------- */
