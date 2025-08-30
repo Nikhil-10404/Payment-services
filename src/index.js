@@ -385,7 +385,7 @@ async function cancelHandler(req, res) {
     const st = String(doc.status || "").toLowerCase();        // 'placed' | 'pending_payment' | 'accepted' | ...
 
     // ✅ Already cancelled
-    if (st === "canceled" || st === "cancelled") {
+    if (st === "canceled") {
       return res.json({ ok: true, id, already: true });
     }
 
@@ -412,7 +412,7 @@ async function cancelHandler(req, res) {
 
     // Update order → cancelled
     await db.updateDocument(DB_ID, ORDERS, id, {
-      status: "cancelled",  // 👈 ensures timeline shows ❌ Cancelled
+      status: "canceled",  // 👈 ensures timeline shows ❌ Cancelled
       paymentStatus: canUPI ? "failed" : doc.paymentStatus,
     });
 
