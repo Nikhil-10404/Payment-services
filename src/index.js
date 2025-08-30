@@ -118,14 +118,35 @@ app.post('/api/orders/create', async (req, res) => {
       total,
       address,       // should include lat/lng
       paymentMethod,
+      userId,        // 👈 must come from frontend
     } = req.body;
 
-    if (!restaurantId || !items || !total || !paymentMethod) {
+    if (!restaurantId || !items || !total || !paymentMethod || !userId) {
       return res.status(400).json({ error: 'missing_required_fields' });
+    }
+
+    // ✅ Sanitize coordinates
+    let destLat = null;
+    let destLng = null;
+
+    if (address) {
+      if (typeof address.lat === "number" && !isNaN(address.lat)) {
+        destLat = Number(address.lat);
+      }
+      if (typeof address.lng === "number" && !isNaN(address.lng)) {
+        destLng = Number(address.lng);
+      }
+    }
+
+    if (destLat === null || destLng === null) {
+      console.warn(`[WARN] No valid lat/lng in address for order. Fallback to 0,0`);
+      destLat = 0;
+      destLng = 0;
     }
 
     // 1) Create order doc (store full address as JSON string)
     const orderDoc = await db.createDocument(DB_ID, ORDERS, ID.unique(), {
+      userId,  // 👈 required by Appwrite schema
       restaurantId,
       restaurantName,
       items: JSON.stringify(items),
@@ -135,7 +156,7 @@ app.post('/api/orders/create', async (req, res) => {
       gst,
       discount,
       total,
-      address: JSON.stringify(address || {}), // keep original full payload
+      address: JSON.stringify(address || {}),
       paymentMethod,
       paymentStatus: 'pending',
       status: 'placed',
@@ -144,65 +165,61 @@ app.post('/api/orders/create', async (req, res) => {
     // 2) Get restaurant (start point)
     const rest = await db.getDocument(DB_ID, RESTAURANTS, restaurantId);
 
-    // 3) Extract and validate destination coords from address
-    let destLat = null, destLng = null;
-    if (address) {
-      if (typeof address.lat === "number" && !isNaN(address.lat)) {
-        destLat = address.lat;
-      }
-      if (typeof address.lng === "number" && !isNaN(address.lng)) {
-        destLng = address.lng;
-      }
-    }
-
-    if (destLat === null || destLng === null) {
-      console.warn(`[WARN] No valid lat/lng in address for order ${orderDoc.$id}, fallback to 0,0`);
-      destLat = 0;
-      destLng = 0;
-    }
-
-    // 4) Create driver doc with clean coords
+    // 3) Create driver doc with clean coords
     const driverDoc = await db.createDocument(DB_ID, DRIVERS, ID.unique(), {
       orderId: orderDoc.$id,
-      lat: rest.lat,
-      lng: rest.lng,
+      lat: Number(rest.lat),
+      lng: Number(rest.lng),
       destLat,
       destLng,
       status: 'preparing',
     });
 
-    // 5) Start driver simulator 🚀
+    // 4) Start driver simulator 🚀
     startDriverSimulator(driverDoc.$id, {
-      startLat: rest.lat,
-      startLng: rest.lng,
+      startLat: Number(rest.lat),
+      startLng: Number(rest.lng),
       destLat,
       destLng,
       orderId: orderDoc.$id,
     });
 
-    // 6) If UPI → create Razorpay link
+    // 5) If UPI → create Razorpay link
     if (paymentMethod === 'UPI') {
-      const linkRes = await fetch(`${BASE}/api/payments/create-link`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          amount: total,
-          name: address?.fullName,
-          contact: address?.phone,
-          referenceId: orderDoc.$id,
-        }),
-      });
-      const linkJson = await linkRes.json();
-      return res.json({ ok: true, order: orderDoc, payment: linkJson });
+      try {
+        const linkRes = await fetch(`${BASE}/api/payments/create-link`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            amount: total,
+            name: address?.fullName,
+            contact: address?.phone,
+            referenceId: orderDoc.$id,
+          }),
+        });
+
+        if (!linkRes.ok) {
+          throw new Error(`Razorpay link creation failed: ${linkRes.status}`);
+        }
+
+        const linkJson = await linkRes.json();
+        return res.json({ ok: true, order: orderDoc, payment: linkJson });
+      } catch (err) {
+        console.error("⚠️ Razorpay link error:", err);
+        return res.json({ ok: true, order: orderDoc, payment: null });
+      }
     }
 
-    // COD → return order
+    // 6) COD → return order
     return res.json({ ok: true, order: orderDoc });
+
   } catch (e) {
-    console.error('create-order error:', e?.message || e);
+    console.error('❌ create-order error:', e?.message || e);
     return res.status(500).json({ error: 'failed_to_create_order', detail: e?.message });
   }
 });
+
+
 
 
 /* --------------------------------------------------------------------------
