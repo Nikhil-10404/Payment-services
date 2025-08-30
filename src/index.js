@@ -193,8 +193,7 @@ if (paymentMethod === "UPI") {
   try {
     if (!BASE) throw new Error("PUBLIC_BASE_URL missing");
     const plRef = `${orderDoc.$id}-${Date.now()}`;
-   const callbackUrl = req.body.callbackUrl || `${BASE}/rzp/callback?ref=${encodeURIComponent(orderDoc.$id)}`;
-
+   const callbackUrl = `${BASE}/rzp/callback?ref=${encodeURIComponent(orderDoc.$id)}`;
     // ✅ ensure amount is integer paise
     const amountPaise = Math.round(parseFloat(total) * 100);
     if (!amountPaise || isNaN(amountPaise)) {
@@ -362,15 +361,16 @@ app.get('/rzp/callback', async (req, res) => {
 
     // 👇 Use deep link if configured, else frontend URL
     let redirectUrl;
-    if (process.env.APP_DEEP_LINK_SCHEME) {
-      // Example: APP_DEEP_LINK_SCHEME=myapp://
-      redirectUrl = `${process.env.APP_DEEP_LINK_SCHEME}orders/${orderIdFromNotes}`;
-    } else {
-      redirectUrl = `${process.env.APP_FRONTEND_URL}/orders/${orderIdFromNotes}`;
-    }
-
-    console.log("🔗 Redirecting user to:", redirectUrl);
-    return res.redirect(redirectUrl);
+   if (process.env.APP_DEEP_LINK_SCHEME) {
+  redirectUrl = `${process.env.APP_DEEP_LINK_SCHEME}orders/${orderIdFromNotes}`;
+} else if (process.env.APP_FRONTEND_URL) {
+  redirectUrl = `${process.env.APP_FRONTEND_URL}/orders/${orderIdFromNotes}`;
+} else {
+  console.error("❌ Neither APP_DEEP_LINK_SCHEME nor APP_FRONTEND_URL is set!");
+  return res.status(500).send("Missing redirect configuration");
+}
+console.log("🔗 Redirecting user to:", redirectUrl);
+return res.redirect(redirectUrl);
 
   } catch (e) {
     console.error('callback error:', e?.message || e);
