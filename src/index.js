@@ -246,7 +246,7 @@ async function startDriverSimulator(driverId, { startLat, startLng, destLat, des
   console.log(`[SIM] Starting driver simulator for order ${orderId}`);
 
   let lat = startLat, lng = startLng;
-  const step = 0.0005; // ≈ 50m per step
+  const step = 0.00087; // ≈ 50m per step
 
   // Step 1: mark order as preparing
   try {
@@ -268,37 +268,45 @@ async function startDriverSimulator(driverId, { startLat, startLng, destLat, des
   }, 5000); // wait 5s in "preparing" before going out
 
   // Step 2: move driver until delivered
-  const interval = setInterval(async () => {
-    try {
-      const dLat = destLat - lat;
-      const dLng = destLng - lng;
+  // Step 2: move driver until delivered
+const interval = setInterval(async () => {
+  try {
+    const dLat = destLat - lat;
+    const dLng = destLng - lng;
 
-      // Arrived
-      if (Math.abs(dLat) < 0.0005 && Math.abs(dLng) < 0.0005) {
-        await db.updateDocument(DB_ID, DRIVERS, driverId, {
-          lat: destLat,
-          lng: destLng,
-          status: "delivered",
-        });
-        await db.updateDocument(DB_ID, ORDERS, orderId, {
-          status: "delivered",
-        });
-        console.log(`[SIM] Order ${orderId} delivered ✅`);
-        clearInterval(interval);
-        return;
-      }
+    // Arrived
+    if (Math.abs(dLat) < 0.0005 && Math.abs(dLng) < 0.0005) {
+      await db.updateDocument(DB_ID, DRIVERS, driverId, {
+        lat: destLat,
+        lng: destLng,
+        status: "delivered",
+      });
 
-      // Move closer step by step
-      lat += step * Math.sign(dLat);
-      lng += step * Math.sign(dLng);
+      // ✅ Mark delivered + auto-set COD as paid
+      const order = await db.getDocument(DB_ID, ORDERS, orderId);
+      await db.updateDocument(DB_ID, ORDERS, orderId, {
+        status: "delivered",
+        paymentStatus:
+          order.paymentMethod === "COD" ? "paid" : order.paymentStatus,
+      });
 
-      await db.updateDocument(DB_ID, DRIVERS, driverId, { lat, lng });
-      console.log(`[SIM] Driver ${driverId} moved closer`);
-    } catch (e) {
-      console.error("[SIM] error", e?.message || e);
+      console.log(`[SIM] Order ${orderId} delivered ✅`);
       clearInterval(interval);
+      return;
     }
-  }, 5000); // every 5s
+
+    // Move closer step by step
+    lat += step * Math.sign(dLat);
+    lng += step * Math.sign(dLng);
+
+    await db.updateDocument(DB_ID, DRIVERS, driverId, { lat, lng });
+    console.log(`[SIM] Driver ${driverId} moved closer`);
+  } catch (e) {
+    console.error("[SIM] error", e?.message || e);
+    clearInterval(interval);
+  }
+}, 5000); // every 5s
+ // every 5s
 }
 
 app.get('/rzp/callback', async (req, res) => {
