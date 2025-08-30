@@ -104,6 +104,9 @@ app.use(express.json({ limit: '1mb' }));
 /* ------------------------------------------------------------------
    Create Order (COD or UPI) → auto-create driver doc & start simulator
 ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------
+   Create Order (COD or UPI) → auto-create driver doc & start simulator
+------------------------------------------------------------------ */
 app.post('/api/orders/create', async (req, res) => {
   try {
     const {
@@ -118,7 +121,7 @@ app.post('/api/orders/create', async (req, res) => {
       total,
       address,       // should include lat/lng
       paymentMethod,
-      userId,        // 👈 must come from frontend
+      userId,        // 👈 required
     } = req.body;
 
     if (!restaurantId || !items || !total || !paymentMethod || !userId) {
@@ -126,9 +129,7 @@ app.post('/api/orders/create', async (req, res) => {
     }
 
     // ✅ Sanitize coordinates
-    let destLat = null;
-    let destLng = null;
-
+    let destLat = null, destLng = null;
     if (address) {
       if (typeof address.lat === "number" && !isNaN(address.lat)) {
         destLat = Number(address.lat);
@@ -137,16 +138,14 @@ app.post('/api/orders/create', async (req, res) => {
         destLng = Number(address.lng);
       }
     }
-
     if (destLat === null || destLng === null) {
-      console.warn(`[WARN] No valid lat/lng in address for order. Fallback to 0,0`);
-      destLat = 0;
-      destLng = 0;
+      console.warn(`[WARN] No valid lat/lng in address. Fallback 0,0`);
+      destLat = 0; destLng = 0;
     }
 
-    // 1) Create order doc (store full address as JSON string)
+    // 1) Create order doc
     const orderDoc = await db.createDocument(DB_ID, ORDERS, ID.unique(), {
-      userId,  // 👈 required by Appwrite schema
+      userId,  // 👈 must match schema
       restaurantId,
       restaurantName,
       items: JSON.stringify(items),
@@ -158,24 +157,24 @@ app.post('/api/orders/create', async (req, res) => {
       total,
       address: JSON.stringify(address || {}),
       paymentMethod,
-      paymentStatus: 'pending',
-      status: 'placed',
+      paymentStatus: "pending",
+      status: "placed",
     });
 
     // 2) Get restaurant (start point)
     const rest = await db.getDocument(DB_ID, RESTAURANTS, restaurantId);
 
-    // 3) Create driver doc with clean coords
+    // 3) Create driver doc
     const driverDoc = await db.createDocument(DB_ID, DRIVERS, ID.unique(), {
       orderId: orderDoc.$id,
       lat: Number(rest.lat),
       lng: Number(rest.lng),
       destLat,
       destLng,
-      status: 'preparing',
+      status: "preparing",
     });
 
-    // 4) Start driver simulator 🚀
+    // 4) Start simulator
     startDriverSimulator(driverDoc.$id, {
       startLat: Number(rest.lat),
       startLng: Number(rest.lng),
@@ -184,43 +183,54 @@ app.post('/api/orders/create', async (req, res) => {
       orderId: orderDoc.$id,
     });
 
-    // 5) If UPI → create Razorpay link
-    if (paymentMethod === 'UPI') {
+    // 5) If UPI → create Razorpay Payment Link
+    if (paymentMethod === "UPI") {
       try {
-        const linkRes = await fetch(`${BASE}/api/payments/create-link`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            amount: total,
-            name: address?.fullName,
-            contact: address?.phone,
-            referenceId: orderDoc.$id,
-          }),
+        if (!BASE) {
+          throw new Error("PUBLIC_BASE_URL missing");
+        }
+        const plRef = `${orderDoc.$id}-${Date.now()}`;
+        const callbackUrl = `${BASE}/rzp/callback?ref=${encodeURIComponent(orderDoc.$id)}`;
+
+        const link = await razorpay.paymentLink.create({
+          amount: Math.round(Number(total) * 100), // paise
+          currency: "INR",
+          accept_partial: false,
+          upi_link: true,
+          reference_id: plRef,
+          description: `Foodie order ${orderDoc.$id}`,
+          customer: {
+            name: address?.fullName || "Foodie Customer",
+            email: address?.email || undefined,
+            contact: address?.phone || undefined,
+          },
+          notify: { sms: !!address?.phone, email: !!address?.email },
+          reminder_enable: true,
+          callback_url: callbackUrl,
+          callback_method: "get",
+          notes: { referenceId: orderDoc.$id },
         });
 
-        if (!linkRes.ok) {
-          throw new Error(`Razorpay link creation failed: ${linkRes.status}`);
-        }
+        // mark order as pending_payment
+        await db.updateDocument(DB_ID, ORDERS, orderDoc.$id, {
+          status: "pending_payment",
+          paymentStatus: "pending",
+        });
 
-        const linkJson = await linkRes.json();
-        return res.json({ ok: true, order: orderDoc, payment: linkJson });
+        return res.json({ ok: true, order: orderDoc, payment: link });
       } catch (err) {
         console.error("⚠️ Razorpay link error:", err);
         return res.json({ ok: true, order: orderDoc, payment: null });
       }
     }
 
-    // 6) COD → return order
+    // COD → return order
     return res.json({ ok: true, order: orderDoc });
-
   } catch (e) {
-    console.error('❌ create-order error:', e?.message || e);
-    return res.status(500).json({ error: 'failed_to_create_order', detail: e?.message });
+    console.error("❌ create-order error:", e?.message || e);
+    return res.status(500).json({ error: "failed_to_create_order", detail: e?.message });
   }
 });
-
-
-
 
 /* --------------------------------------------------------------------------
    🚀 Driver Simulator (auto runs per order)
@@ -286,6 +296,144 @@ async function startDriverSimulator(driverId, { startLat, startLng, destLat, des
     }
   }, 5000); // every 5s
 }
+
+app.get('/rzp/callback', async (req, res) => {
+  try {
+    const appwriteOrderId = String(req.query.ref || '');
+    const linkId = String(req.query.razorpay_payment_link_id || '');
+    const linkStatus = String(req.query.razorpay_payment_link_status || ''); // paid / created / cancelled
+    const paymentId = String(req.query.razorpay_payment_id || '');
+
+    let finalPaid = linkStatus === 'paid';
+    let orderIdFromNotes = appwriteOrderId;
+
+    if (linkId) {
+      try {
+        const link = await razorpay.paymentLink.fetch(linkId);
+        if (link?.status === 'paid') finalPaid = true;
+        if (link?.notes?.referenceId) orderIdFromNotes = link.notes.referenceId;
+      } catch (e) {
+        console.warn('Fetch payment link failed:', e?.message || e);
+      }
+    }
+
+    if (finalPaid && orderIdFromNotes) {
+      try {
+        await db.updateDocument(DB_ID, ORDERS, orderIdFromNotes, {
+          paymentStatus: 'paid',
+          status: 'placed',
+        });
+      } catch (e) {
+        console.warn('Appwrite update (callback) failed:', e?.message || e);
+      }
+    }
+
+    res.setHeader('Content-Type', 'text/html');
+    return res.end(`
+      <html>
+        <head><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
+        <body style="font-family:system-ui,-apple-system,Segoe UI,Roboto;padding:24px;text-align:center;">
+          <h2>${finalPaid ? 'Payment Successful 🎉' : 'Payment Pending'}</h2>
+          <p>${finalPaid ? 'You can go back to Foodie now.' : 'If you have completed payment, please return to Foodie.'}</p>
+          <button onclick="history.back()" style="padding:12px 18px;border-radius:10px;border:0;background:#111827;color:#fff;font-weight:800">Back</button>
+          ${paymentId ? `<p style="color:#6b7280;margin-top:10px;">Txn: ${paymentId}</p>` : ''}
+        </body>
+      </html>
+    `);
+  } catch (e) {
+    console.error('callback error:', e?.message || e);
+    return res.status(500).send('callback_error');
+  }
+});
+
+/* --------------------------------------------------------------------------
+   Payment Status (client polls this if needed)
+-------------------------------------------------------------------------- */
+app.get('/api/payments/status/:referenceId', async (req, res) => {
+  try {
+    const ref = req.params.referenceId;
+    const order = await db.getDocument(DB_ID, ORDERS, ref);
+    const ps = String(order.paymentStatus || 'pending').toLowerCase();
+    const normalized = ps === 'paid' ? 'paid' : ps === 'failed' ? 'failed' : 'pending';
+    return res.json({ referenceId: ref, status: normalized, rawStatus: ps });
+  } catch (err) {
+    const msg = err?.error?.description || err?.message || 'unknown_error';
+    console.error('status error:', msg, err?.error || err);
+    return res.status(500).json({ error: 'failed_to_fetch_status', detail: msg });
+  }
+});
+
+/* --------------------------------------------------------------------------
+   Cancel Order (UPI pending or COD placed)
+   - Idempotent
+   - Allows UPI cancel while link is pending (status 'pending_payment' or paymentStatus 'pending')
+-------------------------------------------------------------------------- */
+app.post('/api/orders/cancel/:id', cancelHandler);
+app.post('/api/payments/cancel/:id', cancelHandler);
+
+async function cancelHandler(req, res) {
+  try {
+    const id = req.params.id;
+    const doc = await db.getDocument(DB_ID, ORDERS, id);
+
+    const pm = String(doc.paymentMethod || "").toUpperCase(); // 'UPI' | 'COD'
+    const ps = String(doc.paymentStatus || "").toLowerCase(); // 'pending' | 'paid' | 'failed'
+    const st = String(doc.status || "").toLowerCase();        // 'placed' | 'pending_payment' | 'accepted' | ...
+
+    // ✅ Already cancelled
+    if (st === "canceled" || st === "cancelled") {
+      return res.json({ ok: true, id, already: true });
+    }
+
+    // ❌ Block if already delivered
+    if (st === "delivered") {
+      return res.status(409).json({
+        error: "not_cancellable",
+        reason: "already_delivered",
+      });
+    }
+
+    // ✅ COD cancellable before delivered
+    const canCOD = pm === "COD" && st !== "delivered";
+
+    // ✅ UPI cancellable if still pending
+    const canUPI = pm === "UPI" && (ps === "pending" || st === "pending_payment");
+
+    if (!canUPI && !canCOD) {
+      return res.status(409).json({
+        error: "not_cancellable",
+        reason: { paymentMethod: pm, paymentStatus: ps, status: st },
+      });
+    }
+
+    // Update order → cancelled
+    await db.updateDocument(DB_ID, ORDERS, id, {
+      status: "cancelled",  // 👈 ensures timeline shows ❌ Cancelled
+      paymentStatus: canUPI ? "failed" : doc.paymentStatus,
+    });
+
+    // Cleanup driver docs if any
+    try {
+      const drivers = await db.listDocuments(DB_ID, DRIVERS, [Query.equal("orderId", id)]);
+      await Promise.all(
+        (drivers.documents || []).map((d) =>
+          db.deleteDocument(DB_ID, DRIVERS, d.$id)
+        )
+      );
+    } catch (err) {
+      console.warn("[cancelHandler] driver cleanup failed:", err?.message || err);
+    }
+
+    return res.json({ ok: true, id, cancelled: true, method: pm });
+  } catch (e) {
+    console.error("cancel error:", e?.message || e);
+    return res.status(500).json({
+      error: "cancel_failed",
+      detail: e?.message || "unknown_error",
+    });
+  }
+}
+
 
 
 /* --------------------------------- Start ---------------------------------- */
