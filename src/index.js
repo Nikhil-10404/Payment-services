@@ -219,7 +219,7 @@ const paymentPayload = {
 };
 
 // 👇 only set upi_link in live mode
-if (process.env.NODE_ENV === "production") {
+if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_ID.startsWith("rzp_live_")) {
   paymentPayload.upi_link = true;
 }
 
