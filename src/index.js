@@ -115,43 +115,49 @@ app.post('/api/orders/create', async (req, res) => {
       gst,
       discount,
       total,
-      address,       // should include lat/lng
+      address,
       paymentMethod,
-      userId,        // 👈 required
+      userId,
     } = req.body;
 
-    if (!restaurantId || !items || !total || !paymentMethod || !userId) {
+    // ✅ Correct validation
+    if (!restaurantId || !Array.isArray(items) || items.length === 0 || !total || !paymentMethod || !userId) {
+      console.error("❌ Validation failed:", {
+        restaurantId,
+        userId,
+        paymentMethod,
+        itemsType: typeof items,
+        itemsLength: Array.isArray(items) ? items.length : "not array",
+        total,
+      });
       return res.status(400).json({ error: 'missing_required_fields' });
     }
 
     // ✅ Sanitize coordinates
     let destLat = null, destLng = null;
     if (address) {
-      if (typeof address.lat === "number" && !isNaN(address.lat)) {
-        destLat = Number(address.lat);
-      }
-      if (typeof address.lng === "number" && !isNaN(address.lng)) {
-        destLng = Number(address.lng);
-      }
+      if (typeof address.lat === "number" && !isNaN(address.lat)) destLat = Number(address.lat);
+      if (typeof address.lng === "number" && !isNaN(address.lng)) destLng = Number(address.lng);
     }
     if (destLat === null || destLng === null) {
       console.warn(`[WARN] No valid lat/lng in address. Fallback 0,0`);
-      destLat = 0; destLng = 0;
+      destLat = 0;
+      destLng = 0;
     }
 
     // 1) Create order doc
     const orderDoc = await db.createDocument(DB_ID, ORDERS, ID.unique(), {
-      userId,  // 👈 must match schema
+      userId,
       restaurantId,
       restaurantName,
-      items: JSON.stringify(items),
+      items: JSON.stringify(items),          // ✅ stringify array
       subTotal,
       platformFee,
       deliveryFee,
       gst,
       discount,
       total,
-      address: JSON.stringify(address || {}),
+      address: JSON.stringify(address || {}), // ✅ stringify address
       paymentMethod,
       paymentStatus: "pending",
       status: "placed",
@@ -170,7 +176,7 @@ app.post('/api/orders/create', async (req, res) => {
       status: "preparing",
     });
 
-    // 4) Start simulator
+    // 4) Start driver simulator
     startDriverSimulator(driverDoc.$id, {
       startLat: Number(rest.lat),
       startLng: Number(rest.lng),
@@ -179,17 +185,15 @@ app.post('/api/orders/create', async (req, res) => {
       orderId: orderDoc.$id,
     });
 
-    // 5) If UPI → create Razorpay Payment Link
+    // 5) Handle UPI
     if (paymentMethod === "UPI") {
       try {
-        if (!BASE) {
-          throw new Error("PUBLIC_BASE_URL missing");
-        }
+        if (!BASE) throw new Error("PUBLIC_BASE_URL missing");
         const plRef = `${orderDoc.$id}-${Date.now()}`;
         const callbackUrl = `${BASE}/rzp/callback?ref=${encodeURIComponent(orderDoc.$id)}`;
 
         const link = await razorpay.paymentLink.create({
-          amount: Math.round(Number(total) * 100), // paise
+          amount: Math.round(Number(total) * 100),
           currency: "INR",
           accept_partial: false,
           upi_link: true,
@@ -207,12 +211,12 @@ app.post('/api/orders/create', async (req, res) => {
           notes: { referenceId: orderDoc.$id },
         });
 
-        // mark order as pending_payment
         await db.updateDocument(DB_ID, ORDERS, orderDoc.$id, {
           status: "pending_payment",
           paymentStatus: "pending",
         });
 
+        console.log("✅ Order created (UPI):", orderDoc.$id);
         return res.json({ ok: true, order: orderDoc, payment: link });
       } catch (err) {
         console.error("⚠️ Razorpay link error:", err);
@@ -221,7 +225,9 @@ app.post('/api/orders/create', async (req, res) => {
     }
 
     // COD → return order
+    console.log("✅ Order created (COD):", orderDoc.$id);
     return res.json({ ok: true, order: orderDoc });
+
   } catch (e) {
     console.error("❌ create-order error:", e?.message || e);
     return res.status(500).json({ error: "failed_to_create_order", detail: e?.message });
