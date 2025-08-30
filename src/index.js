@@ -329,12 +329,11 @@ const interval = setInterval(async () => {
 }, 5000); // every 5s
  // every 5s
 }
-
 app.get('/rzp/callback', async (req, res) => {
   try {
     const appwriteOrderId = String(req.query.ref || '');
     const linkId = String(req.query.razorpay_payment_link_id || '');
-    const linkStatus = String(req.query.razorpay_payment_link_status || ''); // paid / created / cancelled
+    const linkStatus = String(req.query.razorpay_payment_link_status || ''); 
     const paymentId = String(req.query.razorpay_payment_id || '');
 
     let finalPaid = linkStatus === 'paid';
@@ -361,23 +360,16 @@ app.get('/rzp/callback', async (req, res) => {
       }
     }
 
-    res.setHeader('Content-Type', 'text/html');
-    return res.end(`
-      <html>
-        <head><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-        <body style="font-family:system-ui,-apple-system,Segoe UI,Roboto;padding:24px;text-align:center;">
-          <h2>${finalPaid ? 'Payment Successful 🎉' : 'Payment Pending'}</h2>
-          <p>${finalPaid ? 'You can go back to Foodie now.' : 'If you have completed payment, please return to Foodie.'}</p>
-          <button onclick="history.back()" style="padding:12px 18px;border-radius:10px;border:0;background:#111827;color:#fff;font-weight:800">Back</button>
-          ${paymentId ? `<p style="color:#6b7280;margin-top:10px;">Txn: ${paymentId}</p>` : ''}
-        </body>
-      </html>
-    `);
+    // 👇 Redirect back to frontend OrderDetails
+    return res.redirect(
+      `${process.env.APP_FRONTEND_URL}/orders/${orderIdFromNotes}`
+    );
   } catch (e) {
     console.error('callback error:', e?.message || e);
     return res.status(500).send('callback_error');
   }
 });
+
 
 /* --------------------------------------------------------------------------
    Payment Status (client polls this if needed)
