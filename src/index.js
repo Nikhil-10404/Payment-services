@@ -200,12 +200,10 @@ if (paymentMethod === "UPI") {
     if (!amountPaise || isNaN(amountPaise)) {
       throw new Error(`Invalid order total: ${total}`);
     }
-
-   const link = await razorpay.paymentLink.create({
+const paymentPayload = {
   amount: Math.round(Number(total) * 100),
   currency: "INR",
   accept_partial: false,
-  upi_link: true,
   reference_id: plRef,
   description: `Foodie order ${orderDoc.$id}`,
   customer: {
@@ -215,10 +213,17 @@ if (paymentMethod === "UPI") {
   },
   notify: { sms: !!address?.phone, email: !!address?.email },
   reminder_enable: true,
-  callback_url: callbackUrl,   // 👈 updated
+  callback_url: callbackUrl,
   callback_method: "get",
   notes: { referenceId: orderDoc.$id },
-});
+};
+
+// 👇 only set upi_link in live mode
+if (process.env.NODE_ENV === "production") {
+  paymentPayload.upi_link = true;
+}
+
+const link = await razorpay.paymentLink.create(paymentPayload);
 
 
     await db.updateDocument(DB_ID, ORDERS, orderDoc.$id, {
