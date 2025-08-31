@@ -65,7 +65,6 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
       if (notesRef) {
         await db.updateDocument(DB_ID, ORDERS, notesRef, {
           paymentStatus: 'paid',
-          status: 'placed',
         }).catch(e => console.warn('[Webhook] update failed', e?.message));
       }
       return res.json({ ok: true });
@@ -76,7 +75,6 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
       if (orderId) {
         await db.updateDocument(DB_ID, ORDERS, orderId, {
           paymentStatus: 'paid',
-          status: 'placed',
         }).catch(e => console.warn('[Webhook] captured update failed', e?.message));
       }
       return res.json({ ok: true });
@@ -386,9 +384,16 @@ app.get('/rzp/callback', async (req, res) => {
       });
     }
 
-     const redirectUrl = `foodie://orders/${orderIdFromNotes}`;
- console.log("🔗 Redirecting user to:", redirectUrl);
-return res.redirect(redirectUrl);
+      // 🔑 Show a simple HTML page that redirects ONCE to your app
+  const redirectUrl = `foodie://orders/${orderIdFromNotes}`;
+   return res.send(`
+     <html>
+       <head><meta http-equiv="refresh" content="0;url=${redirectUrl}" /></head>
+       <body>
+         <p>Redirecting to app... If not redirected, <a href="${redirectUrl}">click here</a>.</p>
+       </body>
+     </html>
+   `)
   } catch (e) {
     return res.status(500).send('callback_error');
   }
