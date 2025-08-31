@@ -258,9 +258,9 @@ if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_ID.startsWith("rzp_l
 const link = await razorpay.paymentLink.create(paymentPayload);
 
 
-    await db.updateDocument(DB_ID, ORDERS, orderDoc.$id, {
-      status: "pending_payment",
-      paymentStatus: "pending",
+      await db.updateDocument(DB_ID, ORDERS, orderDoc.$id, {
+     status: "placed",
+     paymentStatus: "pending",
     });
 
     console.log("✅ Order created (UPI):", orderDoc.$id);
@@ -386,13 +386,9 @@ app.get('/rzp/callback', async (req, res) => {
       });
     }
 
-    if (req.query.user_redirect === '1') {
-      const redirectUrl = `foodie://orders/${orderIdFromNotes}`;
-      console.log("🔗 Redirecting user to:", redirectUrl);
-      return res.redirect(redirectUrl);
-    }
-
-    return res.json({ ok: true });
+     const redirectUrl = `foodie://orders/${orderIdFromNotes}`;
+ console.log("🔗 Redirecting user to:", redirectUrl);
+return res.redirect(redirectUrl);
   } catch (e) {
     return res.status(500).send('callback_error');
   }
