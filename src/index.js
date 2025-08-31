@@ -365,7 +365,6 @@ async function startDriverSimulator(driverId, { startLat, startLng, destLat, des
   }, 5000);
 }
 
-
 app.get('/rzp/callback', async (req, res) => {
   try {
     let orderIdFromNotes = String(req.query.ref || '');
@@ -377,28 +376,27 @@ app.get('/rzp/callback', async (req, res) => {
         const link = await razorpay.paymentLink.fetch(linkId);
         if (link?.status === 'paid') finalPaid = true;
         if (link?.notes?.referenceId) orderIdFromNotes = link.notes.referenceId;
-      } catch (e) {
-        console.warn('Fetch payment link failed:', e?.message);
-      }
+      } catch {}
     }
 
     if (finalPaid && orderIdFromNotes) {
       await db.updateDocument(DB_ID, ORDERS, orderIdFromNotes, {
-        paymentStatus: 'paid',   // ✅ Mark as paid now
-        status: 'placed',        // order still placed, not delivered
+        paymentStatus: 'paid'
+        // do NOT overwrite status here
       });
     }
 
-    const redirectUrl = `foodie://orders/${orderIdFromNotes}`;
-    console.log("🔗 Redirecting user to:", redirectUrl);
-    return res.redirect(redirectUrl);
+    if (req.query.user_redirect === '1') {
+      const redirectUrl = `foodie://orders/${orderIdFromNotes}`;
+      console.log("🔗 Redirecting user to:", redirectUrl);
+      return res.redirect(redirectUrl);
+    }
 
+    return res.json({ ok: true });
   } catch (e) {
-    console.error('callback error:', e?.message);
     return res.status(500).send('callback_error');
   }
 });
-
 
 /* --------------------------------------------------------------------------
    Payment Status (client polls this if needed)
