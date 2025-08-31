@@ -312,7 +312,9 @@ async function startDriverSimulator(driverId, { startLat, startLng, destLat, des
   console.log(`[SIM] Starting driver simulator for order ${orderId}`);
 
   let lat = startLat, lng = startLng;
-  const step = 0.00087; // ≈ 50m per step
+  const step = 0.00087; // ≈ 95m per step
+  const threshold = 0.0005; // ≈ 55m
+  let ticks = 0;
 
   // Step 1: mark order as preparing
   try {
@@ -331,49 +333,51 @@ async function startDriverSimulator(driverId, { startLat, startLng, destLat, des
     } catch (e) {
       console.warn("[SIM] failed to set on_the_way:", e?.message || e);
     }
-  }, 5000); // wait 5s in "preparing" before going out
+  }, 5000);
 
   // Step 2: move driver until delivered
-  // Step 2: move driver until delivered
-const interval = setInterval(async () => {
-  try {
-    const dLat = destLat - lat;
-    const dLng = destLng - lng;
+  const interval = setInterval(async () => {
+    ticks++;
+    try {
+      const dLat = destLat - lat;
+      const dLng = destLng - lng;
 
-    // Arrived
-    if (Math.abs(dLat) < 0.0005 && Math.abs(dLng) < 0.0005) {
-      await db.updateDocument(DB_ID, DRIVERS, driverId, {
-        lat: destLat,
-        lng: destLng,
-        status: "delivered",
-      });
+      console.log(`[SIM] Tick ${ticks} | dLat=${dLat.toFixed(6)} dLng=${dLng.toFixed(6)} lat=${lat.toFixed(6)} lng=${lng.toFixed(6)}`);
 
-      // ✅ Mark delivered + auto-set COD as paid
-      const order = await db.getDocument(DB_ID, ORDERS, orderId);
-      await db.updateDocument(DB_ID, ORDERS, orderId, {
-        status: "delivered",
-        paymentStatus:
-          order.paymentMethod === "COD" ? "paid" : order.paymentStatus,
-      });
+      // Arrived?
+      if (Math.abs(dLat) < threshold && Math.abs(dLng) < threshold) {
+        console.log(`[SIM] Order ${orderId} arrived within threshold after ${ticks} ticks`);
+        await db.updateDocument(DB_ID, DRIVERS, driverId, {
+          lat: destLat,
+          lng: destLng,
+          status: "delivered",
+        });
 
-      console.log(`[SIM] Order ${orderId} delivered ✅`);
+        const order = await db.getDocument(DB_ID, ORDERS, orderId);
+        await db.updateDocument(DB_ID, ORDERS, orderId, {
+          status: "delivered",
+          paymentStatus:
+            order.paymentMethod === "COD" ? "paid" : order.paymentStatus,
+        });
+
+        console.log(`[SIM] Order ${orderId} delivered ✅`);
+        clearInterval(interval);
+        return;
+      }
+
+      // Move closer step by step
+      lat += step * Math.sign(dLat);
+      lng += step * Math.sign(dLng);
+
+      await db.updateDocument(DB_ID, DRIVERS, driverId, { lat, lng });
+      console.log(`[SIM] Driver ${driverId} moved closer`);
+    } catch (e) {
+      console.error("[SIM] error during tick", e);
       clearInterval(interval);
-      return;
     }
-
-    // Move closer step by step
-    lat += step * Math.sign(dLat);
-    lng += step * Math.sign(dLng);
-
-    await db.updateDocument(DB_ID, DRIVERS, driverId, { lat, lng });
-    console.log(`[SIM] Driver ${driverId} moved closer`);
-  } catch (e) {
-    console.error("[SIM] error", e?.message || e);
-    clearInterval(interval);
-  }
-}, 5000); // every 5s
- // every 5s
+  }, 5000);
 }
+
 
 app.get('/rzp/callback', async (req, res) => {
   try {
