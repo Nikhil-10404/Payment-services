@@ -100,39 +100,14 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
 
 // Compatibility route for older frontend clients
 // Compatibility route for old frontend, DO NOT create order here
-// Compatibility route for old frontend, DO NOT create new orders here
 app.post('/api/payments/create-link', async (req, res) => {
   try {
-    const { referenceId, amount, name, userId } = req.body || {};
+    const { referenceId, amount, name } = req.body || {};
 
-    // 🛡️ Guard: if referenceId is missing/empty
-    if (!referenceId) {
-      console.warn("⚠️ Missing referenceId in create-link call, healing…");
-
-      if (userId && ORDERS) {
-        try {
-          // Find the latest order for this user
-          const orders = await db.listDocuments(DB_ID, ORDERS, [
-            Query.equal("userId", userId),
-            Query.orderDesc("$createdAt"),
-            Query.limit(1),
-          ]);
-
-          if (orders.documents?.length > 0) {
-            const latest = orders.documents[0];
-            return res.json({
-              ok: true,
-              payment: { existing: true, healed: true },
-              order: latest,
-            });
-          }
-        } catch (err) {
-          console.warn("[create-link] healing lookup failed:", err?.message);
-        }
-      }
-
-      // Nothing found → return graceful no-op
-      return res.json({ ok: false, ignored: true, healed: false });
+    // 🚫 If no referenceId/amount → ignore gracefully instead of error
+    if (!referenceId || !amount) {
+      console.warn("⚠️ Ignored empty/invalid create-link call", req.body);
+      return res.json({ ok: false, ignored: true });
     }
 
     // 🔑 Normalize referenceId → strip "-timestamp" if present
