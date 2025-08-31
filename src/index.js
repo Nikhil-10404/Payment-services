@@ -103,10 +103,24 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
 app.post('/api/payments/create-link', async (req, res) => {
   try {
     const { referenceId, amount, name } = req.body;
+
     if (!referenceId || !amount) {
       return res.status(400).json({ error: "missing_required_fields" });
     }
 
+    // 🔑 If referenceId matches an existing order → just return it
+    try {
+      const order = await db.getDocument(DB_ID, ORDERS, referenceId);
+      return res.json({
+        ok: true,
+        payment: { existing: true }, // signal to frontend no new link
+        order,
+      });
+    } catch (err) {
+      // not an existing orderId → fallback to creating a new link
+    }
+
+    // Legacy compatibility flow → create new link
     const paymentPayload = {
       amount: Math.round(Number(amount) * 100),
       currency: "INR",
@@ -123,6 +137,7 @@ app.post('/api/payments/create-link', async (req, res) => {
 
     const link = await razorpay.paymentLink.create(paymentPayload);
     return res.json({ ok: true, payment: link });
+
   } catch (err) {
     console.error("⚠️ create-link error:", err?.message);
     return res.status(500).json({ error: "upi_create_link_failed" });
