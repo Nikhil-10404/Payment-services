@@ -108,19 +108,20 @@ app.post('/api/payments/create-link', async (req, res) => {
       return res.status(400).json({ error: "missing_required_fields" });
     }
 
-    // 🔑 If referenceId matches an existing order → just return it
+    // 🔑 Try to match existing order by stripping "-timestamp"
+    const baseRef = referenceId.split("-")[0];
     try {
-      const order = await db.getDocument(DB_ID, ORDERS, referenceId);
+      const order = await db.getDocument(DB_ID, ORDERS, baseRef);
       return res.json({
         ok: true,
-        payment: { existing: true }, // signal to frontend no new link
+        payment: { existing: true },
         order,
       });
     } catch (err) {
-      // not an existing orderId → fallback to creating a new link
+      // not an existing orderId → continue legacy mode
     }
 
-    // Legacy compatibility flow → create new link
+    // Legacy flow → create new link
     const paymentPayload = {
       amount: Math.round(Number(amount) * 100),
       currency: "INR",
