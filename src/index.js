@@ -101,15 +101,13 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
 });
 
 // Compatibility route for older frontend clients
+// Compatibility route for old frontend, DO NOT create order here
 app.post('/api/payments/create-link', async (req, res) => {
   try {
-    const { referenceId, amount, name, callbackUrl } = req.body;
-
+    const { referenceId, amount, name } = req.body;
     if (!referenceId || !amount) {
       return res.status(400).json({ error: "missing_required_fields" });
     }
-
-    if (!BASE) throw new Error("PUBLIC_BASE_URL missing");
 
     const paymentPayload = {
       amount: Math.round(Number(amount) * 100),
@@ -117,30 +115,19 @@ app.post('/api/payments/create-link', async (req, res) => {
       accept_partial: false,
       reference_id: `${referenceId}-${Date.now()}`,
       description: `Foodie order ${referenceId}`,
-      customer: {
-        name: name || "Foodie Customer",
-      },
+      customer: { name: name || "Foodie Customer" },
       notify: { sms: false, email: false },
       reminder_enable: true,
-
-      // 👇 Always send backend callback URL (must be https)
-      callback_url: `${BASE}/rzp/callback?ref=${encodeURIComponent(referenceId)}&redirect=${encodeURIComponent(callbackUrl)}`,
+      callback_url: `${BASE}/rzp/callback?ref=${encodeURIComponent(referenceId)}`,
       callback_method: "get",
-
       notes: { referenceId },
     };
 
-    if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_ID.startsWith("rzp_live_")) {
-      paymentPayload.upi_link = true;
-    }
-
     const link = await razorpay.paymentLink.create(paymentPayload);
-
-    console.log("✅ Payment link created (compat mode):", referenceId);
     return res.json({ ok: true, payment: link });
   } catch (err) {
-    console.error("⚠️ create-link error:", err?.message, err);
-    return res.status(500).json({ error: "upi_create_link_failed", detail: err?.message });
+    console.error("⚠️ create-link error:", err?.message);
+    return res.status(500).json({ error: "upi_create_link_failed" });
   }
 });
 
@@ -381,14 +368,9 @@ async function startDriverSimulator(driverId, { startLat, startLng, destLat, des
 
 app.get('/rzp/callback', async (req, res) => {
   try {
-    const appwriteOrderId = String(req.query.ref || '');
-    const linkId = String(req.query.razorpay_payment_link_id || '');
-    const linkStatus = String(req.query.razorpay_payment_link_status || ''); 
-    const paymentId = String(req.query.razorpay_payment_id || '');
-    const redirect = decodeURIComponent(req.query.redirect || '') || null;
-
-    let finalPaid = linkStatus === 'paid';
-    let orderIdFromNotes = appwriteOrderId;
+    let orderIdFromNotes = String(req.query.ref || '');
+    const linkId = req.query.razorpay_payment_link_id || '';
+    let finalPaid = req.query.razorpay_payment_link_status === 'paid';
 
     if (linkId) {
       try {
@@ -396,41 +378,26 @@ app.get('/rzp/callback', async (req, res) => {
         if (link?.status === 'paid') finalPaid = true;
         if (link?.notes?.referenceId) orderIdFromNotes = link.notes.referenceId;
       } catch (e) {
-        console.warn('Fetch payment link failed:', e?.message || e);
+        console.warn('Fetch payment link failed:', e?.message);
       }
     }
 
     if (finalPaid && orderIdFromNotes) {
-      try {
-        await db.updateDocument(DB_ID, ORDERS, orderIdFromNotes, {
-          paymentStatus: 'pending',  // stays pending until delivery
-        });
-      } catch (e) {
-        console.warn('Appwrite update (callback) failed:', e?.message || e);
-      }
+      await db.updateDocument(DB_ID, ORDERS, orderIdFromNotes, {
+        paymentStatus: 'paid',   // ✅ Mark as paid now
+        status: 'placed',        // order still placed, not delivered
+      });
     }
 
-    // 👇 Redirect logic
-    let redirectUrl;
-    if (redirect) {
-      redirectUrl = redirect; // e.g. foodie://orders/xxx
-    } else if (process.env.APP_DEEP_LINK_SCHEME) {
-      redirectUrl = `${process.env.APP_DEEP_LINK_SCHEME}orders/${orderIdFromNotes}`;
-    } else if (process.env.APP_FRONTEND_URL) {
-      redirectUrl = `${process.env.APP_FRONTEND_URL}/orders/${orderIdFromNotes}`;
-    } else {
-      console.error("❌ Neither APP_DEEP_LINK_SCHEME nor APP_FRONTEND_URL is set!");
-      return res.status(500).send("Missing redirect configuration");
-    }
-
+    const redirectUrl = `foodie://orders/${orderIdFromNotes}`;
     console.log("🔗 Redirecting user to:", redirectUrl);
     return res.redirect(redirectUrl);
+
   } catch (e) {
-    console.error('callback error:', e?.message || e);
+    console.error('callback error:', e?.message);
     return res.status(500).send('callback_error');
   }
 });
-
 
 
 /* --------------------------------------------------------------------------
