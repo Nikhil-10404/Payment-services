@@ -102,14 +102,18 @@ app.post('/api/razorpay/webhook', express.raw({ type: 'application/json' }), asy
 // Compatibility route for old frontend, DO NOT create order here
 app.post('/api/payments/create-link', async (req, res) => {
   try {
-    const { referenceId, amount, name } = req.body;
+    const { referenceId, amount, name } = req.body || {};
 
+    // 🚫 If no referenceId/amount → ignore gracefully instead of error
     if (!referenceId || !amount) {
-      return res.status(400).json({ error: "missing_required_fields" });
+      console.warn("⚠️ Ignored empty/invalid create-link call", req.body);
+      return res.json({ ok: false, ignored: true });
     }
 
-    // 🔑 Try to match existing order by stripping "-timestamp"
+    // 🔑 Normalize referenceId → strip "-timestamp" if present
     const baseRef = referenceId.split("-")[0];
+
+    // Try to fetch an existing order
     try {
       const order = await db.getDocument(DB_ID, ORDERS, baseRef);
       return res.json({
@@ -118,10 +122,10 @@ app.post('/api/payments/create-link', async (req, res) => {
         order,
       });
     } catch (err) {
-      // not an existing orderId → continue legacy mode
+      // no existing order → continue to legacy flow
     }
 
-    // Legacy flow → create new link
+    // Legacy flow: create new payment link
     const paymentPayload = {
       amount: Math.round(Number(amount) * 100),
       currency: "INR",
@@ -131,9 +135,9 @@ app.post('/api/payments/create-link', async (req, res) => {
       customer: { name: name || "Foodie Customer" },
       notify: { sms: false, email: false },
       reminder_enable: true,
-      callback_url: `${BASE}/rzp/callback?ref=${encodeURIComponent(referenceId)}`,
+      callback_url: `${BASE}/rzp/callback?ref=${encodeURIComponent(baseRef)}`,
       callback_method: "get",
-      notes: { referenceId },
+      notes: { referenceId: baseRef },
     };
 
     const link = await razorpay.paymentLink.create(paymentPayload);
@@ -144,6 +148,7 @@ app.post('/api/payments/create-link', async (req, res) => {
     return res.status(500).json({ error: "upi_create_link_failed" });
   }
 });
+
 
 
 /* ------------------------------------------------------------------
